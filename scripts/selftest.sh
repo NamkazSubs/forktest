@@ -43,4 +43,55 @@ took=$(( $(date +%s) - start ))
 check "--timeout kills a hanging test" "Tests: 2, Assertions: 1, Errors: 1." "$slow"
 if [ "$took" -lt 15 ]; then echo "ok    --timeout returned in ${took}s (test sleeps 30s)"; else echo "FAIL  --timeout took ${took}s"; fail=1; fi
 
+# --- impact selection, in a throwaway git repo -------------------------------------------------------------
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"; rm -f "$JX"' EXIT
+mkdir -p "$TMP/src" "$TMP/tests"
+cat > "$TMP/src/Calc.php" <<'PHP'
+<?php
+class Calc { public function add($a, $b) { return $a + $b; } }
+PHP
+cat > "$TMP/tests/CalcTest.php" <<'PHP'
+<?php
+require_once __DIR__ . '/../src/Calc.php';
+class CalcTest extends \PHPUnit\Framework\TestCase { public function testAdd() { $this->assertSame(3, (new Calc)->add(1, 2)); } }
+PHP
+cat > "$TMP/tests/OtherTest.php" <<'PHP'
+<?php
+class OtherTest extends \PHPUnit\Framework\TestCase { public function testOther() { $this->assertTrue(true); } }
+PHP
+cat > "$TMP/phpunit.xml" <<XML
+<phpunit bootstrap="$BOOT"><testsuites><testsuite name="t"><directory suffix="Test.php">tests</directory></testsuite></testsuites></phpunit>
+XML
+echo "docs" > "$TMP/README.txt"
+( cd "$TMP" && git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm base )
+( cd "$TMP" && php "$HERE/bin/forktest" --record-map .forktest/map.json >/dev/null 2>&1 )
+ft() { ( cd "$TMP" && php "$HERE/bin/forktest" "$@" 2>&1 ); }
+
+echo "// touched" >> "$TMP/src/Calc.php"
+sel=$(ft --changed --since HEAD --list | grep -a '^ - ')
+check "impact: a changed source file selects only the test that loads it" " - CalcTest::testAdd" "$sel"
+[[ "$sel" != *OtherTest* ]] && echo "ok    impact: the unrelated test is not selected" || { echo "FAIL  impact: OtherTest was selected"; fail=1; }
+( cd "$TMP" && git checkout -q -- src/Calc.php )
+
+echo "more docs" >> "$TMP/README.txt"
+none=$(ft --changed --since HEAD)
+check "impact: a docs-only change selects nothing" "No test files are affected" "$none"
+( cd "$TMP" && git checkout -q -- README.txt )
+
+echo '{}' > "$TMP/composer.json"
+all=$(ft --changed --since HEAD)
+check "impact: composer.json selects everything" "selected 2 of 2 test files (ALL: composer.json changed)" "$all"
+rm -f "$TMP/composer.json"
+
+cat > "$TMP/tests/NewTest.php" <<'PHP'
+<?php
+class NewTest extends \PHPUnit\Framework\TestCase { public function testNew() { $this->assertTrue(true); } }
+PHP
+new=$(ft --changed --since HEAD --list | grep -a '^ - ')
+check "impact: a test file that is not in the map is always selected" " - NewTest::testNew" "$new"
+rm -f "$TMP/tests/NewTest.php"
+
+rc=$(cd "$TMP" && php "$HERE/bin/forktest" --record-map .forktest/m2.json --filter x >/dev/null 2>&1; echo $?)
+check "--record-map refuses partial runs" "2" "$rc"
+
 exit $fail

@@ -19,6 +19,7 @@ vendor/bin/forktest                      # jalankan suite dari phpunit.xml
 vendor/bin/forktest tests/Unit/Services  # jalankan satu folder atau satu file
 vendor/bin/forktest --filter Transfer    # hanya test yang namanya cocok
 vendor/bin/forktest --fast               # lebih cepat lagi, isolasi lebih lemah (lihat di bawah)
+vendor/bin/forktest --changed            # hanya test yang terdampak perubahan git kamu (lihat di bawah)
 ```
 
 ## Hasil
@@ -149,6 +150,63 @@ untuk kesalahan penggunaan.
 `--preload` memberi hasil identik di benchmark tapi tidak membuat run lebih cepat secara berarti setelah opcache
 menyala, jadi dimatikan secara default.
 
+## Impact selection: jalankan hanya test yang bisa terdampak perubahanmu
+
+Kebanyakan perubahan hanya menyentuh beberapa file, jadi kebanyakan test tidak mungkin terdampak. forktest bisa
+mencari tahu yang mana.
+
+```bash
+vendor/bin/forktest --record-map .forktest/map.json   # sekali, dan ulangi setelah merge besar (full run)
+vendor/bin/forktest --changed                         # test terdampak sejak merge-base dengan master/main
+vendor/bin/forktest --since origin/develop            # ... atau terhadap ref git apa pun
+vendor/bin/forktest --changed --explain               # sekaligus cetak alasan tiap file test dipilih
+```
+
+Tambahkan `.forktest/` ke `.gitignore`. `--changed`/`--since` membaca peta dari `.forktest/map.json` kecuali kamu
+memberi `--map FILE`.
+
+Cara kerja. Setiap test sudah berjalan di proses sendiri, jadi setelah test selesai forktest bertanya ke PHP file
+project mana saja yang dimuat proses itu (`get_included_files()`, vendor dikecualikan). Itulah peta dependensinya:
+file project ke file test yang memuatnya. Tidak butuh driver coverage dan biaya merekamnya tidak terasa. `--changed`
+lalu mengambil `git diff` terhadap base (file yang di-commit, staged, unstaged, dan untracked) dan memilih:
+
+- file test yang memuat file yang berubah, dan file test yang berubah sendiri;
+- file test yang tidak ada di peta (test baru), selalu;
+- untuk file PHP berubah yang belum pernah dilihat peta, file test yang menyebut nama class-nya;
+- file test yang membaca file project dari disk (`file_get_contents`, `glob`, `getFileName()`, ...), kalau file yang
+  berubah disebut di source-nya, karena peta berbasis include tidak bisa melihat pembacaan itu;
+- **semuanya**, kalau `composer.json`/`composer.lock`, `phpunit.xml(.dist)`, `tests/bootstrap.php`, `.env*`, atau file
+  yang dimuat bootstrap berubah.
+
+Perubahan non-PHP (dokumen, aset) tidak memilih apa pun; kalau tidak ada yang terdampak, forktest mengatakannya dan
+keluar dengan kode `0`. Pilihan dicetak ke stderr, termasuk berapa commit peta tertinggal dari `HEAD`.
+
+Diukur pada suite 6.954 test (PHP 7.3, 4 core):
+
+| Apa                                                          | Hasil                                               |
+|--------------------------------------------------------------|-----------------------------------------------------|
+| Merekam peta saat full run                                   | 49,0 detik vs 48,5 detik tanpa rekam; 82 KB untuk 331 file test / 766 file project |
+| Merekam dua kali                                             | peta identik (0 dari 331 file test yang berbeda)    |
+| Ukuran peta yang umum                                        | satu file test memuat median 6 file project (maksimum 75); hanya 388 dari 1.533 file `app/` yang dimuat test unit mana pun |
+| Branch nyata (23 file berubah)                               | 32 dari 331 file test, 509 dari 6.954 test: **4,6 detik** vs 48,5 detik |
+| 509 test yang sama, dibandingkan dengan full run             | status setiap test identik                          |
+| Cek keamanan: 7 file project sengaja dirusak, suite penuh dijalankan tiap kali | 0 file test terdampak yang terlewat (lihat di bawah) |
+
+Cek keamanannya menyalin repository, menambahkan `throw` di akhir file yang dimuat test (1 sampai 91 file test
+memuatnya), menjalankan seluruh suite, lalu membandingkannya dengan run tanpa modifikasi. Setiap test yang hasilnya
+berubah, termasuk test yang hilang karena file-nya tidak lagi bisa dimuat, ada di dalam pilihan. Pilihan bersifat
+superset: untuk file yang dimuat 91 file test, 54 file test berubah hasilnya dan keseluruhan 91 terpilih.
+
+Yang tidak bisa dilihat: apa pun yang bukan file PHP yang dimuat lewat `include`/autoload saat perekaman, seperti
+data dari database, nilai `.env`, file JSON/YAML yang dibaca kode yang dites, atau jalur kode yang hanya dilewati
+test pada sebagian run. Heuristik pembaca file menutup sebagian, bukan semuanya. Cek keamanan di atas merusak file saat
+dimuat, jadi ia memvalidasi hubungan include, bukan perilaku setiap jalur kode.
+
+Perlakukan `--changed` sebagai siklus edit-lalu-jalankan yang cepat, dan tetap jalankan full run untuk CI dan sebelum
+merge. Rekam ulang peta setelah merge besar atau ketika `--changed` melaporkan peta tertinggal banyak commit: test yang
+mulai memuat file baru hanya ditemukan lewat file yang berubah, bukan lewat file barunya sendiri, sampai peta
+diperbarui.
+
 ## Logging
 
 Output default sengaja ringkas, karena fokus forktest adalah kecepatan: satu huruf per test
@@ -190,6 +248,7 @@ kembali seperti biasa.
   (dengan `suffix`) yang dibaca. Pengaturan seperti `processIsolation`, `backupGlobals`, `<exclude>`, `<listeners>`,
   dan `<filter>` diabaikan.
 - `setUpBeforeClass` dan `tearDownAfterClass` berjalan sekali per test, bukan sekali per class, di kedua mode.
+- Impact selection hanya tahu apa yang dimuat test lewat `include`/autoload PHP saat peta direkam (lihat di atas).
 - Output yang dicetak test dibuang. Test yang gagal menampilkan dua baris pertama pesannya kecuali kamu memakai `-v`.
 - Test yang tidak menghasilkan hasil selama 120 detik (ubah dengan `--timeout`) dihentikan dan dilaporkan sebagai
   error.

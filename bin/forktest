@@ -37,6 +37,11 @@ Options:
       --timeout SEC     kill a test that produces no result for SEC seconds (default 120)
       --stop-on-failure stop at the first error or failure (also on with stopOnFailure="true" in phpunit.xml)
       --log-junit FILE  write a JUnit XML report to FILE
+      --record-map FILE record which project files each test file loads (a full run; writes the impact map)
+      --changed         only run test files affected by what changed since the merge-base with master
+      --since REF       like --changed, but against the given git ref (branch, tag or commit)
+      --map FILE        impact map to read for --changed/--since (default: .forktest/map.json)
+      --explain         with --changed/--since: print why each test file was selected
       --fast            run tests of one file in ONE process (much faster, but tests can leak state to each
                         other). Files that use Mockery alias:/overload: are still isolated per test.
       --preload         load PHPUnit/Mockery classes once in the parent before forking
@@ -71,7 +76,8 @@ function cpuCount(): int
 
 $cli = ['jobs' => cpuCount(), 'filter' => null, 'fast' => false, 'preload' => false, 'opcache' => true,
         'bootstrap' => null, 'list' => false, 'verbose' => false, 'paths' => [],
-        'groups' => [], 'exclude' => [], 'timeout' => 120, 'stop' => false, 'junit' => null];
+        'groups' => [], 'exclude' => [], 'timeout' => 120, 'stop' => false, 'junit' => null,
+        'record' => null, 'since' => null, 'changed' => false, 'map' => '.forktest/map.json', 'explain' => false];
 $splitList = static function (string $v): array {
     return array_values(array_filter(array_map('trim', explode(',', $v)), 'strlen'));
 };
@@ -128,6 +134,21 @@ for ($i = 0; $i < count($argvList); $i++) {
         case '--log-junit':
             $cli['junit'] = $val();
             break;
+        case '--record-map':
+            $cli['record'] = $val();
+            break;
+        case '--since':
+            $cli['since'] = $val();
+            break;
+        case '--changed':
+            $cli['changed'] = true;
+            break;
+        case '--map':
+            $cli['map'] = $val();
+            break;
+        case '--explain':
+            $cli['explain'] = true;
+            break;
         case '--fast':
             $cli['fast'] = true;
             break;
@@ -157,6 +178,13 @@ for ($i = 0; $i < count($argvList); $i++) {
             }
             $cli['paths'][] = $a;
     }
+}
+
+if ($cli['record'] !== null
+    && ($cli['paths'] || $cli['filter'] !== null || $cli['groups'] || $cli['exclude'] || $cli['stop']
+        || $cli['since'] !== null || $cli['changed'] || $cli['list'])) {
+    usageError('--record-map needs a full run: do not combine it with paths, --filter, --group, --exclude-group, '
+        . '--stop-on-failure, --since, --changed or --list');
 }
 
 if (!function_exists('pcntl_fork') || !function_exists('posix_kill')) {
@@ -239,6 +267,16 @@ if ($xml !== null) {
 
 require $bootstrap;
 
+// project files already loaded by the bootstrap are "global": every test has them, so they are not recorded per test
+$GLOBALS['forktest_root'] = $root;
+$GLOBALS['forktest_base'] = [];
+foreach (get_included_files() as $f) {
+    if (strncmp($f, $root . '/', strlen($root) + 1) === 0) {
+        $GLOBALS['forktest_base'][substr($f, strlen($root) + 1)] = true;
+    }
+}
+$GLOBALS['forktest_record'] = $cli['record'] !== null;
+
 if (!class_exists(TestCase::class)) {
     fwrite(STDERR, "forktest: PHPUnit\\Framework\\TestCase not found. Is phpunit/phpunit installed and autoloaded by the bootstrap?\n");
     exit(2);
@@ -276,6 +314,164 @@ function collectFiles(string $path, string $suffix): array
     return $files;
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// Impact map: which project files does each test file load? (recorded with --record-map, used by --changed/--since)
+// ---------------------------------------------------------------------------------------------------------------
+const MAP_VERSION = 1;
+// a change to one of these can affect every test
+const RUN_ALL_RE  = '#^(composer\.(json|lock)|phpunit\.xml(\.dist)?|tests/bootstrap\.php|\.env(\..*)?)$#';
+// tests that read project files from disk: the include-based map cannot see those reads
+const READER_RE   = '/file_get_contents|\bfile\s*\(|\bglob\s*\(|scandir|getFileName\s*\(|SplFileObject|RecursiveDirectoryIterator|\bfopen\s*\(/';
+
+function gitOut(string $root, string $args): ?array
+{
+    $out = [];
+    $rc  = 0;
+    exec('git -C ' . escapeshellarg($root) . ' ' . $args . ' 2>/dev/null', $out, $rc);
+    return $rc === 0 ? $out : null;
+}
+
+/** The commit to diff against: --since REF, else the merge-base with master/main. */
+function resolveBase(string $root, ?string $since): ?string
+{
+    if ($since !== null) {
+        $r = gitOut($root, 'rev-parse --verify --quiet ' . escapeshellarg($since . '^{commit}'));
+        return $r ? trim($r[0]) : null;
+    }
+    foreach (['origin/master', 'master', 'origin/main', 'main'] as $b) {
+        $mb = gitOut($root, 'merge-base HEAD ' . escapeshellarg($b));
+        if ($mb) {
+            return trim($mb[0]);
+        }
+    }
+    return null;
+}
+
+/** Files changed since $base: committed, staged, unstaged and untracked (renames count as delete + add). */
+function changedFiles(string $root, string $base): array
+{
+    $a = gitOut($root, 'diff --name-only --no-renames ' . escapeshellarg($base) . ' --') ?? [];
+    $b = gitOut($root, 'ls-files --others --exclude-standard') ?? [];
+    return array_values(array_unique(array_filter(array_merge($a, $b), 'strlen')));
+}
+
+function writeMap(string $file, string $root, array $acc, array $files): bool
+{
+    $table = [];
+    $ids   = [];
+    $tests = [];
+    foreach ($acc as $abs => $set) {
+        $list = [];
+        foreach (array_keys($set) as $f) {
+            if (!isset($ids[$f])) {
+                $ids[$f]  = count($table);
+                $table[]  = $f;
+            }
+            $list[] = $ids[$f];
+        }
+        sort($list);
+        $tests[substr($abs, strlen($root) + 1)] = $list;
+    }
+    $readers = [];
+    foreach ($files as $abs) {
+        if (isset($acc[$abs]) && preg_match(READER_RE, (string) file_get_contents($abs))) {
+            $readers[] = substr($abs, strlen($root) + 1);
+        }
+    }
+    $head = gitOut($root, 'rev-parse HEAD');
+    $data = ['version' => MAP_VERSION, 'root' => $root, 'head' => $head ? trim($head[0]) : null, 'created' => date('c'),
+             'php' => PHP_VERSION, 'globals' => array_keys($GLOBALS['forktest_base']), 'files' => $table,
+             'tests' => $tests, 'readers' => $readers];
+    $dir = dirname($file);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0777, true);
+    }
+    return @file_put_contents($file, json_encode($data, JSON_UNESCAPED_SLASHES)) !== false;
+}
+
+/**
+ * Which of $files (absolute test file paths) are affected by $changed (project-relative paths)?
+ * @return array{0: array<string, string[]>, 1: array} [relative test file => reasons, info]
+ */
+function selectImpacted(array $files, string $root, array $map, array $changed): array
+{
+    $rel      = static function (string $f) use ($root): string { return substr($f, strlen($root) + 1); };
+    $testRels = array_map($rel, $files);
+    $isTest   = array_flip($testRels);
+    $table    = $map['files'] ?? [];
+    $rev      = [];
+    foreach ($map['tests'] ?? [] as $t => $ids) {
+        foreach ($ids as $i) {
+            $rev[$table[$i]][] = $t;
+        }
+    }
+    $globals = array_flip($map['globals'] ?? []);
+    $sel     = [];
+    $info    = ['all' => null, 'unmapped' => [], 'ignored' => 0];
+    $add     = static function (string $t, string $why) use (&$sel): void {
+        $sel[$t][] = $why;
+    };
+    $src     = [];
+    $source  = static function (string $t) use (&$src, $root): string {
+        return $src[$t] ?? ($src[$t] = (string) @file_get_contents("$root/$t"));
+    };
+    $mentions = static function (string $text, string $c): bool {
+        $b = basename($c, '.php');
+        return strpos($text, $c) !== false || ($b !== '' && preg_match('/\b' . preg_quote($b, '/') . '\b/', $text));
+    };
+
+    foreach ($testRels as $t) {
+        if (!isset($map['tests'][$t])) {
+            $add($t, 'not in the map');
+        }
+    }
+    foreach ($changed as $c) {
+        if (preg_match(RUN_ALL_RE, $c)) {
+            $info['all'] = "$c changed";
+            continue;
+        }
+        if (isset($globals[$c])) {
+            $info['all'] = "$c is loaded by the bootstrap";
+            continue;
+        }
+        if (isset($isTest[$c])) {
+            $add($c, 'test file changed');
+        }
+        foreach ($rev[$c] ?? [] as $t) {
+            if (isset($isTest[$t])) {
+                $add($t, "loads $c");
+            }
+        }
+        if (substr($c, -4) !== '.php') {
+            $info['ignored']++;
+        } elseif (!isset($rev[$c]) && !isset($isTest[$c])) {
+            // new or never-loaded PHP file: fall back to a text search for its class name
+            $hit = false;
+            foreach ($testRels as $t) {
+                if (preg_match('/\b' . preg_quote(basename($c, '.php'), '/') . '\b/', $source($t))) {
+                    $add($t, "mentions " . basename($c, '.php') . " ($c is not in the map)");
+                    $hit = true;
+                }
+            }
+            $info['unmapped'][] = $c . ($hit ? '' : ' (no test mentions it)');
+        }
+    }
+    foreach ($map['readers'] ?? [] as $t) {
+        if (!isset($isTest[$t])) {
+            continue;
+        }
+        $text = $source($t);
+        foreach ($changed as $c) {
+            if ($mentions($text, $c)) {
+                $add($t, "reads files and mentions $c");
+                break;
+            }
+        }
+    }
+    return [$sel, $info];
+}
+
 $files = [];
 if ($cli['paths']) {
     foreach ($cli['paths'] as $p) {
@@ -297,6 +493,57 @@ if ($cli['paths']) {
 }
 $files = array_values(array_unique(array_map('realpath', $files)));
 sort($files);
+
+if ($cli['since'] !== null || $cli['changed']) {
+    $mapPath = $cli['map'][0] === '/' ? $cli['map'] : "$root/{$cli['map']}";
+    $map     = is_file($mapPath) ? json_decode((string) file_get_contents($mapPath), true) : null;
+    if (!is_array($map) || ($map['version'] ?? 0) !== MAP_VERSION) {
+        fwrite(STDERR, "forktest: no usable impact map at {$cli['map']}. Record one with a full run first:\n"
+            . "  forktest --record-map {$cli['map']}\n");
+        exit(2);
+    }
+    $base = resolveBase($root, $cli['since']);
+    if ($base === null) {
+        fwrite(STDERR, "forktest: cannot find the git base to diff against; pass --since REF\n");
+        exit(2);
+    }
+    $changed = changedFiles($root, $base);
+    [$sel, $info] = selectImpacted($files, $root, $map, $changed);
+
+    $behind = null;
+    if (!empty($map['head'])) {
+        $n      = gitOut($root, 'rev-list --count ' . escapeshellarg($map['head']) . '..HEAD');
+        $behind = $n ? (int) $n[0] : null;
+    }
+    $total = count($files);
+    if ($info['all'] !== null) {
+        $picked = $files;
+    } else {
+        $picked = array_values(array_filter($files, static function ($f) use ($sel, $root) {
+            return isset($sel[substr($f, strlen($root) + 1)]);
+        }));
+    }
+    fprintf(STDERR, "forktest impact: base %s | %d changed file(s) | selected %d of %d test files%s | map from %s%s\n",
+        substr($base, 0, 10), count($changed), count($picked), $total,
+        $info['all'] !== null ? " (ALL: {$info['all']})" : '',
+        isset($map['head']) ? substr((string) $map['head'], 0, 10) : '?',
+        $behind !== null ? ($behind === 0 ? '' : " ($behind commit(s) behind HEAD, consider re-recording)") : '');
+    if ($info['unmapped']) {
+        fprintf(STDERR, "  not in the map (new or never loaded by a test): %s\n", implode(', ', array_slice($info['unmapped'], 0, 8))
+            . (count($info['unmapped']) > 8 ? ' ...' : ''));
+    }
+    if ($cli['explain']) {
+        ksort($sel);
+        foreach ($sel as $t => $why) {
+            fprintf(STDERR, "  %s  <- %s\n", $t, implode('; ', array_slice(array_unique($why), 0, 3)));
+        }
+    }
+    if (!$picked) {
+        echo "No test files are affected by the changes.\n";
+        exit(0);
+    }
+    $files = $picked;
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 // Child-side helpers
@@ -391,9 +638,25 @@ function runTestCase(string $class, TestCase $t, int $idx): array
             break;
         }
     }
-    return ['type' => 'res', 'idx' => $idx, 'name' => $t->toString(), 'status' => $status,
+    $out = ['type' => 'res', 'idx' => $idx, 'name' => $t->toString(), 'status' => $status,
             'assertions' => $t->getNumAssertions(), 'msg' => $msg, 'trace' => $trace, 'etype' => $etype,
             'time' => $time, 'file' => (new ReflectionClass($class))->getFileName()];
+    if ($GLOBALS['forktest_record']) {
+        $root = $GLOBALS['forktest_root'] . '/';
+        $inc  = [];
+        foreach (get_included_files() as $f) {
+            if (strncmp($f, $root, strlen($root)) !== 0) {
+                continue;
+            }
+            $rel = substr($f, strlen($root));
+            if (strncmp($rel, 'vendor/', 7) === 0 || strncmp($rel, 'storage/', 8) === 0 || isset($GLOBALS['forktest_base'][$rel])) {
+                continue;
+            }
+            $inc[] = $rel;
+        }
+        $out['inc'] = $inc;
+    }
+    return $out;
 }
 
 /**
@@ -523,6 +786,7 @@ $execTask = static function (array $task, $sock): void {
 // ---------------------------------------------------------------------------------------------------------------
 $jobs   = $cli['jobs'];
 $stat   = ['pass' => 0, 'error' => 0, 'failure' => 0, 'warning' => 0, 'skipped' => 0, 'incomplete' => 0, 'risky' => 0];
+$mapAcc = [];   // --record-map: test file => [project file => true]
 $bad    = [];
 $notes  = [];   // skipped / incomplete / risky tests (listed with -v)
 $all    = [];   // every result, for --log-junit
@@ -530,7 +794,14 @@ $assert = 0;
 $done   = 0;
 $total  = 0;
 $mark   = ['pass' => '.', 'error' => 'E', 'failure' => 'F', 'warning' => 'W', 'skipped' => 'S', 'incomplete' => 'I', 'risky' => 'R'];
-$record = static function (array $res) use (&$stat, &$assert, &$bad, &$notes, &$all, &$done, &$total, $mark, $cli): void {
+$record = static function (array $res) use (&$stat, &$assert, &$bad, &$notes, &$all, &$mapAcc, &$done, &$total, $mark, $cli): void {
+    if (isset($res['inc'], $res['file'])) {
+        foreach ($res['inc'] as $f) {
+            $mapAcc[$res['file']][$f] = true;
+        }
+        $mapAcc[$res['file']][substr($res['file'], strlen($GLOBALS['forktest_root']) + 1)] = true;
+        unset($res['inc']);
+    }
     $stat[$res['status']]++;
     $assert += (int) $res['assertions'];
     if (in_array($res['status'], ['error', 'failure', 'warning'], true)) {
@@ -946,6 +1217,15 @@ if ($cli['junit'] !== null) {
         fwrite(STDERR, "JUnit report written to {$cli['junit']}\n");
     } else {
         fwrite(STDERR, "forktest: cannot write JUnit report to {$cli['junit']}\n");
+    }
+}
+if ($cli['record'] !== null) {
+    $mapPath = $cli['record'][0] === '/' ? $cli['record'] : "$root/{$cli['record']}";
+    if (writeMap($mapPath, $root, $mapAcc, $files)) {
+        fprintf(STDERR, "Impact map written to %s (%d test files, %d project files)\n", $cli['record'], count($mapAcc),
+            count(array_unique(array_merge(...array_map('array_keys', array_values($mapAcc) ?: [[]])))));
+    } else {
+        fwrite(STDERR, "forktest: cannot write the impact map to {$cli['record']}\n");
     }
 }
 exit($bad ? 1 : 0);

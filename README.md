@@ -18,6 +18,7 @@ vendor/bin/forktest                      # run the suites from phpunit.xml
 vendor/bin/forktest tests/Unit/Services  # run a directory or a file
 vendor/bin/forktest --filter Transfer    # only tests whose name matches
 vendor/bin/forktest --fast               # even faster, weaker isolation (see below)
+vendor/bin/forktest --changed            # only the tests affected by your git changes (see below)
 ```
 
 ## Results
@@ -149,6 +150,61 @@ errors.
 `--preload` ran with identical results in the benchmark but did not make the run measurably faster once opcache
 was on, so it is off by default.
 
+## Impact selection: run only the tests your change can affect
+
+Most changes touch a handful of files, so most tests cannot be affected. forktest can find out which.
+
+```bash
+vendor/bin/forktest --record-map .forktest/map.json   # once, and again after big merges (a full run)
+vendor/bin/forktest --changed                         # tests affected since the merge-base with master/main
+vendor/bin/forktest --since origin/develop            # ... or against any git ref
+vendor/bin/forktest --changed --explain               # also print why each test file was selected
+```
+
+Add `.forktest/` to your `.gitignore`. `--changed`/`--since` read the map from `.forktest/map.json` unless you pass
+`--map FILE`.
+
+How it works. Every test already runs in its own process, so after a test finishes forktest asks PHP which project
+files that process loaded (`get_included_files()`, vendor excluded). That is the dependency map: project file to the
+test files that load it. It needs no coverage driver and costs nothing noticeable to record. `--changed` then takes
+`git diff` against the base (committed, staged, unstaged and untracked files) and selects:
+
+- test files that loaded a changed file, and test files that changed themselves;
+- test files that are not in the map (new tests), always;
+- for a changed PHP file the map has never seen, the test files that mention its class name;
+- test files that read project files from disk (`file_get_contents`, `glob`, `getFileName()`, ...), when a changed
+  file is mentioned in their source, because the include-based map cannot see those reads;
+- **everything**, when `composer.json`/`composer.lock`, `phpunit.xml(.dist)`, `tests/bootstrap.php`, `.env*` or a file
+  loaded by the bootstrap changes.
+
+Non-PHP changes (docs, assets) select nothing; if nothing is affected, forktest says so and exits `0`. The selection is
+printed to stderr, including how many commits behind `HEAD` the map is.
+
+Measured on the 6,954-test suite (PHP 7.3, 4 cores):
+
+| What                                                         | Result                                              |
+|--------------------------------------------------------------|-----------------------------------------------------|
+| Recording the map during a full run                          | 49.0 s vs 48.5 s without; 82 KB for 331 test files / 766 project files |
+| Recording twice                                              | identical maps (0 of 331 test files differ)         |
+| Typical size of the map                                      | a test file loads a median of 6 project files (max 75); only 388 of 1,533 `app/` files are loaded by any unit test |
+| A real branch (23 changed files)                             | 32 of 331 test files, 509 of 6,954 tests: **4.6 s** vs 48.5 s |
+| Same 509 tests, compared with the full run                   | the status of every test is identical               |
+| Safety check: 7 project files broken on purpose, full suite run each time | 0 affected test files missed (see below) |
+
+The safety check copies the repository, appends a `throw` to a file that tests load (1 to 91 test files load it),
+runs the whole suite, and compares it with an unmodified run. Every test whose result changed, including tests that
+vanished because their file no longer loaded, was in the selection. Selection is a superset: for the file loaded by 91
+test files, 54 test files changed result and all 91 were selected.
+
+What it cannot see: anything that is not a PHP file loaded through `include`/autoload at record time, such as data
+read from a database, `.env` values, JSON/YAML files read by the code under test, or code paths that a test only takes
+on some runs. The reader heuristic covers part of that, not all of it. The safety check above breaks files at load
+time, so it validates the include relationship, not the behaviour of every code path.
+
+Treat `--changed` as the fast edit-and-run loop and keep a full run for CI and before you merge. Re-record the map
+after large merges or when `--changed` reports that the map is many commits behind: a test that started loading a new
+file is only found through the file that changed, not through the new file itself, until the map is refreshed.
+
 ## Logging
 
 The default output is lean on purpose, because forktest is about speed: one letter per test
@@ -187,6 +243,7 @@ with ParaTest otherwise). If you rely on such diagnostics, for example while upg
   `<directory>`/`<file>` entries (with `suffix`). Settings such as `processIsolation`, `backupGlobals`,
   `<exclude>`, `<listeners>` and `<filter>` are ignored.
 - `setUpBeforeClass` and `tearDownAfterClass` run once per test, not once per class, in both modes.
+- Impact selection only knows what tests loaded through PHP `include`/autoload when the map was recorded (see above).
 - Output printed by tests is discarded. A failing test shows the first two lines of its message unless you pass `-v`.
 - A test that produces no result for 120 s (change it with `--timeout`) is killed and reported as an error.
 

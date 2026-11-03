@@ -1,6 +1,7 @@
-/vendor/
 composer.lock
-.phpunit.result.cache
-*.log
+.forktest/
 .idea/
+*.log
+.phpunit.result.cache
+/vendor/
 .vscode/
