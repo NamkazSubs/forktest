@@ -76,6 +76,7 @@ the edit-and-run loop and keep the default mode for CI.
 - PHPUnit and the code under test installed in the project, loaded by the project's bootstrap or
   `vendor/autoload.php`.
 - Optional: the `Zend OPcache` extension.
+- Optional: `git` on the `PATH`, only for `--changed` and `--since`.
 
 What has been tested:
 
@@ -95,17 +96,17 @@ Not on Packagist yet. Pick one:
 **A. Composer, from the git repository**
 
 ```bash
-composer config repositories.forktest vcs git@github.com:<your-account>/forktest.git
-composer require --dev forktest/forktest:dev-main
+composer config repositories.forktest vcs https://github.com/NamkazSubs/forktest.git
+composer require --dev namkazsubs/forktest:dev-main
 vendor/bin/forktest
 ```
 
-Before you push, replace the `forktest` vendor in `composer.json` and in the commands above with your own.
+Repository: <https://github.com/NamkazSubs/forktest>. `dev-main` assumes the default branch is called `main`.
 
 **B. Clone and run, no Composer**
 
 ```bash
-git clone git@github.com:<your-account>/forktest.git ~/tools/forktest
+git clone https://github.com/NamkazSubs/forktest.git ~/tools/forktest
 cd /path/to/your/project
 php ~/tools/forktest/bin/forktest
 ```
@@ -243,7 +244,8 @@ with ParaTest otherwise). If you rely on such diagnostics, for example while upg
 - No code coverage, no TestDox/JSON logging, no random order. (JUnit XML, `--group` and `--exclude-group` are
   supported.)
 - No `@depends`. Every test runs in its own process, so a test that depends on another test's result is not
-  supported. The suite it was developed on has none; this has not been tested.
+  supported. It fails loudly: the dependent test is reported as an error and the exit code is `1`, it is not skipped
+  silently (checked with a producer/consumer pair; the suite it was developed on has no `@depends`).
 - From `phpunit.xml` it reads only `bootstrap`, `stopOnFailure`, the `<php>` section and the testsuite
   `<directory>`/`<file>` entries (with `suffix`). Settings such as `processIsolation`, `backupGlobals`,
   `<exclude>`, `<listeners>` and `<filter>` are ignored.

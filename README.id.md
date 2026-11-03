@@ -76,6 +76,7 @@ dan biarkan mode default untuk CI.
 - PHP 7.3 atau lebih baru dengan `pcntl` dan `posix` (Linux atau macOS; Windows tidak didukung).
 - PHPUnit dan kode yang dites terpasang di project, dimuat oleh bootstrap project atau `vendor/autoload.php`.
 - Opsional: ekstensi `Zend OPcache`.
+- Opsional: `git` di `PATH`, hanya untuk `--changed` dan `--since`.
 
 Yang sudah diuji:
 
@@ -95,17 +96,17 @@ Belum ada di Packagist. Pilih salah satu:
 **A. Composer, dari repository git**
 
 ```bash
-composer config repositories.forktest vcs git@github.com:<akun-kamu>/forktest.git
-composer require --dev forktest/forktest:dev-main
+composer config repositories.forktest vcs https://github.com/NamkazSubs/forktest.git
+composer require --dev namkazsubs/forktest:dev-main
 vendor/bin/forktest
 ```
 
-Sebelum push, ganti vendor `forktest` di `composer.json` dan di perintah di atas dengan milikmu.
+Repository: <https://github.com/NamkazSubs/forktest>. `dev-main` mengasumsikan branch default-nya bernama `main`.
 
 **B. Clone lalu jalankan, tanpa Composer**
 
 ```bash
-git clone git@github.com:<akun-kamu>/forktest.git ~/tools/forktest
+git clone https://github.com/NamkazSubs/forktest.git ~/tools/forktest
 cd /path/ke/project-kamu
 php ~/tools/forktest/bin/forktest
 ```
@@ -248,7 +249,8 @@ kembali seperti biasa.
 - Tidak ada code coverage, tidak ada logging TestDox/JSON, tidak ada urutan acak. (JUnit XML, `--group`, dan
   `--exclude-group` didukung.)
 - Tidak ada `@depends`. Setiap test berjalan di prosesnya sendiri, jadi test yang bergantung pada hasil test lain tidak
-  didukung. Suite tempat ia dikembangkan tidak punya satu pun; ini belum diuji.
+  didukung. Gagalnya terdengar: test yang bergantung dilaporkan sebagai error dan kode keluarnya `1`, tidak dilewati
+  diam-diam (dicek dengan pasangan producer/consumer; suite tempat ia dikembangkan tidak punya `@depends`).
 - Dari `phpunit.xml` hanya `bootstrap`, `stopOnFailure`, bagian `<php>`, dan entri `<directory>`/`<file>` testsuite
   (dengan `suffix`) yang dibaca. Pengaturan seperti `processIsolation`, `backupGlobals`, `<exclude>`, `<listeners>`,
   dan `<filter>` diabaikan.

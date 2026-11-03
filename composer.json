@@ -1,5 +1,5 @@
 {
-    "name": "forktest/forktest",
+    "name": "namkazsubs/forktest",
     "description": "Fork-based runner for existing PHPUnit suites: per-test process isolation without re-spawning php.",
     "type": "library",
     "license": "MIT",

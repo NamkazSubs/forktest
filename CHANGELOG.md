@@ -44,11 +44,11 @@ branch ran 509 tests in 4.6 s. Details and caveats are in the README.
 
 - With opcache on, compile-time warnings and deprecations are not turned into test errors; use `--no-opcache` when you
   rely on them. One test differed on PHP 7.4 because of this.
-- Not supported: code coverage, TestDox/JSON logs, random order, `@depends`, `<listeners>`, `processIsolation` from
-  `phpunit.xml`. `setUpBeforeClass` and `tearDownAfterClass` run once per test.
+- Not supported: code coverage, TestDox/JSON logs, random order, `@depends` (a dependent test is reported as an error,
+  not skipped), `<listeners>`, `processIsolation` from `phpunit.xml`. `setUpBeforeClass` and `tearDownAfterClass` run once per test.
 - Impact selection sees only files loaded through PHP `include`/autoload; the map must be re-recorded after large
   merges.
 - Tested only with PHP 7.3 and 7.4 and PHPUnit 7.0 and 7.5, on Linux. PHP 8 and PHPUnit 8 or newer are untested.
 
-[Unreleased]: #
-[0.1.0]: #
+[Unreleased]: https://github.com/NamkazSubs/forktest/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/NamkazSubs/forktest/releases/tag/v0.1.0
