@@ -1,0 +1,25 @@
+{
+    "name": "forktest/forktest",
+    "description": "Fork-based runner for existing PHPUnit suites: per-test process isolation without re-spawning php.",
+    "type": "library",
+    "keywords": ["phpunit", "testing", "parallel", "pcntl", "fork", "test-runner"],
+    "bin": ["bin/forktest"],
+    "require": {
+        "php": ">=7.3",
+        "ext-pcntl": "*",
+        "ext-posix": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^7.0",
+        "mockery/mockery": "^1.0"
+    },
+    "suggest": {
+        "ext-zend-opcache": "Lets forktest enable opcache for its own CLI run (about 2.4x faster); it is optional."
+    },
+    "scripts": {
+        "selftest": "bash scripts/selftest.sh"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

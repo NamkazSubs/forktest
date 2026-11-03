@@ -1,0 +1,753 @@
+#!/usr/bin/env php
+<?php
+/**
+ * forktest - fork-based runner for existing PHPUnit test suites.
+ *
+ * The parent process loads only the bootstrap file. Test files are never loaded in the parent: discovery and
+ * execution both happen in forked children, so every test sees what a fresh `php` process would see.
+ * Test code is run by PHPUnit's own TestCase::run(); only the way tests are isolated and scheduled differs.
+ *
+ * Run `forktest --help` for usage.
+ */
+declare(strict_types=1);
+
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\TestFailure;
+use PHPUnit\Framework\TestResult;
+use PHPUnit\Framework\TestSuite;
+
+const FORKTEST_VERSION = '0.1.0';
+const JSON_FLAGS       = JSON_PARTIAL_OUTPUT_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE;
+
+const HELP = <<<'TXT'
+forktest - fork-based runner for PHPUnit test suites
+
+Usage:
+  forktest [options] [path ...]
+
+  path                  test file or directory (default: the directories of the testsuites in phpunit.xml)
+
+Options:
+  -j, --jobs N          parallel workers (default: number of CPU cores)
+      --filter REGEX    only run tests whose name matches REGEX (e.g. "TransferOwnership" or "::testFoo")
+      --fast            run tests of one file in ONE process (much faster, but tests can leak state to each
+                        other). Files that use Mockery alias:/overload: are still isolated per test.
+      --preload         load PHPUnit/Mockery classes once in the parent before forking
+      --no-opcache      do not enable opcache for the CLI run
+      --bootstrap FILE  bootstrap file (default: "bootstrap" from phpunit.xml, else vendor/autoload.php)
+      --list            list the discovered tests and exit
+  -v, --verbose         print the full message of every failing test
+  -h, --help            show this help
+      --version         show the version
+
+Exit code: 0 when every test passed (skipped/incomplete are fine), 1 otherwise, 2 on usage errors.
+TXT;
+
+// ---------------------------------------------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------------------------------------------
+function usageError(string $msg): void
+{
+    fwrite(STDERR, "forktest: $msg\n\n" . HELP . "\n");
+    exit(2);
+}
+
+function cpuCount(): int
+{
+    $n = (int) trim((string) @shell_exec('nproc 2>/dev/null'));
+    if ($n < 1 && is_readable('/proc/cpuinfo')) {
+        $n = substr_count((string) file_get_contents('/proc/cpuinfo'), "\nprocessor");
+    }
+    return max(1, $n ?: 4);
+}
+
+$cli = ['jobs' => cpuCount(), 'filter' => null, 'fast' => false, 'preload' => false, 'opcache' => true,
+        'bootstrap' => null, 'list' => false, 'verbose' => false, 'paths' => []];
+$argvList = $argv;
+array_shift($argvList);
+for ($i = 0; $i < count($argvList); $i++) {
+    $a = $argvList[$i];
+    if (preg_match('/^-j(\d+)$/', $a, $m)) {   // -j4 == -j 4
+        array_splice($argvList, $i, 1, ['-j', $m[1]]);
+        $a = '-j';
+    }
+    $val = static function () use (&$i, $argvList, $a) {
+        if (strpos($a, '=') !== false) {
+            return substr($a, strpos($a, '=') + 1);
+        }
+        if (!isset($argvList[$i + 1])) {
+            usageError("option $a needs a value");
+        }
+        return $argvList[++$i];
+    };
+    $name = strpos($a, '=') !== false ? substr($a, 0, strpos($a, '=')) : $a;
+    switch ($name) {
+        case '-j':
+        case '--jobs':
+            $cli['jobs'] = (int) $val();
+            if ($cli['jobs'] < 1) {
+                usageError('--jobs must be >= 1');
+            }
+            break;
+        case '--filter':
+            $cli['filter'] = $val();
+            if (@preg_match('/' . str_replace('/', '\/', $cli['filter']) . '/', '') === false) {
+                usageError('--filter is not a valid regular expression');
+            }
+            break;
+        case '--bootstrap':
+            $cli['bootstrap'] = $val();
+            break;
+        case '--fast':
+            $cli['fast'] = true;
+            break;
+        case '--preload':
+            $cli['preload'] = true;
+            break;
+        case '--no-opcache':
+            $cli['opcache'] = false;
+            break;
+        case '--list':
+            $cli['list'] = true;
+            break;
+        case '-v':
+        case '--verbose':
+            $cli['verbose'] = true;
+            break;
+        case '-h':
+        case '--help':
+            echo HELP, "\n";
+            exit(0);
+        case '--version':
+            echo 'forktest ', FORKTEST_VERSION, "\n";
+            exit(0);
+        default:
+            if ($a !== '' && $a[0] === '-') {
+                usageError("unknown option $a");
+            }
+            $cli['paths'][] = $a;
+    }
+}
+
+if (!function_exists('pcntl_fork') || !function_exists('posix_kill')) {
+    fwrite(STDERR, "forktest needs the pcntl and posix PHP extensions (Linux/macOS only).\n");
+    exit(2);
+}
+
+// opcache.enable_cli is PHP_INI_SYSTEM (no ini_set), so re-exec once with it on. Forked children share the
+// compiled scripts. Only this process tree is affected: php.ini and any running PHP-FPM/web app are untouched.
+if ($cli['opcache']
+    && !filter_var(ini_get('opcache.enable_cli'), FILTER_VALIDATE_BOOLEAN)
+    && extension_loaded('Zend OPcache')
+    && !getenv('FORKTEST_REEXEC')
+    && function_exists('pcntl_exec')
+) {
+    putenv('FORKTEST_REEXEC=1');
+    pcntl_exec(PHP_BINARY, array_merge(['-d', 'opcache.enable_cli=1'], $argv));
+    // exec failed: carry on without opcache
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Project discovery (phpunit.xml)
+// ---------------------------------------------------------------------------------------------------------------
+$root = (string) getcwd();
+$xml  = null;
+foreach (['phpunit.xml', 'phpunit.xml.dist'] as $f) {
+    if (is_file("$root/$f")) {
+        $xml = @simplexml_load_file("$root/$f") ?: null;
+        break;
+    }
+}
+
+$bootstrap = $cli['bootstrap'];
+if ($bootstrap === null && $xml !== null && isset($xml['bootstrap'])) {
+    $bootstrap = (string) $xml['bootstrap'];
+}
+$bootstrap = $bootstrap ?? 'vendor/autoload.php';
+$bootstrap = $bootstrap[0] === '/' ? $bootstrap : "$root/$bootstrap";
+if (!is_file($bootstrap)) {
+    fwrite(STDERR, "forktest: bootstrap file not found: $bootstrap\n");
+    exit(2);
+}
+chdir($root);
+
+// Apply the <php> section of phpunit.xml the way PHPUnit does (before the bootstrap file runs).
+if ($xml !== null) {
+    $phpValue = static function (string $v) {
+        $l = strtolower($v);
+        return $l === 'true' ? true : ($l === 'false' ? false : $v);
+    };
+    foreach ($xml->xpath('//php/ini') ?: [] as $n) {
+        ini_set((string) $n['name'], (string) $n['value']);
+    }
+    foreach ($xml->xpath('//php/const') ?: [] as $n) {
+        if (!defined((string) $n['name'])) {
+            define((string) $n['name'], $phpValue((string) $n['value']));
+        }
+    }
+    foreach ($xml->xpath('//php/var') ?: [] as $n) {
+        $GLOBALS[(string) $n['name']] = $phpValue((string) $n['value']);
+    }
+    foreach ($xml->xpath('//php/server') ?: [] as $n) {
+        $_SERVER[(string) $n['name']] = $phpValue((string) $n['value']);
+    }
+    foreach ($xml->xpath('//php/env') ?: [] as $n) {
+        $name  = (string) $n['name'];
+        $force = isset($n['force']) && (string) $n['force'] === 'true';
+        if ($force || getenv($name) === false) {
+            putenv($name . '=' . (string) $n['value']);
+        }
+        if ($force || !isset($_ENV[$name])) {
+            $_ENV[$name] = $phpValue((string) $n['value']);
+        }
+    }
+}
+
+require $bootstrap;
+
+if (!class_exists(TestCase::class)) {
+    fwrite(STDERR, "forktest: PHPUnit\\Framework\\TestCase not found. Is phpunit/phpunit installed and autoloaded by the bootstrap?\n");
+    exit(2);
+}
+
+/** @return array<int, array{string, string}> [path, suffix] */
+function xmlTestSources(?SimpleXMLElement $xml, string $root): array
+{
+    $out = [];
+    if ($xml === null) {
+        return $out;
+    }
+    foreach ($xml->xpath('//testsuites/testsuite/directory') ?: [] as $d) {
+        $out[] = [rtrim($root . '/' . ltrim((string) $d, './'), '/'), (string) ($d['suffix'] ?? 'Test.php')];
+    }
+    foreach ($xml->xpath('//testsuites/testsuite/file') ?: [] as $f) {
+        $out[] = [$root . '/' . ltrim((string) $f, './'), ''];
+    }
+    return $out;
+}
+
+function collectFiles(string $path, string $suffix): array
+{
+    if (is_file($path)) {
+        return [$path];
+    }
+    $files = [];
+    if (is_dir($path)) {
+        foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS)) as $f) {
+            if ($suffix === '' || substr($f->getFilename(), -strlen($suffix)) === $suffix) {
+                $files[] = $f->getPathname();
+            }
+        }
+    }
+    return $files;
+}
+
+$files = [];
+if ($cli['paths']) {
+    foreach ($cli['paths'] as $p) {
+        $real = realpath($p) ?: realpath("$root/$p");
+        if (!$real) {
+            fwrite(STDERR, "forktest: path not found: $p\n");
+            exit(2);
+        }
+        $files = array_merge($files, collectFiles($real, 'Test.php'));
+    }
+} else {
+    foreach (xmlTestSources($xml, $root) as [$p, $suffix]) {
+        $files = array_merge($files, collectFiles($p, $suffix));
+    }
+    if (!$files) {
+        fwrite(STDERR, "forktest: no test paths given and none found in phpunit.xml\n");
+        exit(2);
+    }
+}
+$files = array_values(array_unique(array_map('realpath', $files)));
+sort($files);
+
+// ---------------------------------------------------------------------------------------------------------------
+// Child-side helpers
+// ---------------------------------------------------------------------------------------------------------------
+$GLOBALS['forktest_filter'] = $cli['filter'];
+
+/** Load a test file and return every runnable test in it, as [[class, TestCase], ...]. Must run in a child. */
+function loadTests(string $file): array
+{
+    $before = get_declared_classes();
+    require_once $file;
+    $flatten = static function ($t, array &$out) use (&$flatten): void {
+        if ($t instanceof TestSuite) {
+            foreach ($t->tests() as $c) {
+                $flatten($c, $out);
+            }
+        } else {
+            $out[] = $t;
+        }
+    };
+    $filter = $GLOBALS['forktest_filter'];
+    $tests  = [];
+    foreach (array_diff(get_declared_classes(), $before) as $c) {
+        $r = new ReflectionClass($c);
+        if ($r->isSubclassOf(TestCase::class) && !$r->isAbstract() && $r->getFileName() === $file) {
+            $list = [];
+            $flatten(new TestSuite($c), $list);
+            foreach ($list as $t) {
+                if ($filter === null || preg_match('/' . str_replace('/', '\/', $filter) . '/', $t->toString())) {
+                    $tests[] = [$c, $t];
+                }
+            }
+        }
+    }
+    return $tests;
+}
+
+function clean(string $s): string
+{
+    return (string) json_decode((string) json_encode($s, JSON_FLAGS), true);
+}
+
+/** Run one TestCase in the current process and classify the outcome. */
+function runTestCase(string $class, TestCase $t, int $idx): array
+{
+    $hooks = \PHPUnit\Util\Test::getHookMethods($class);
+    $res   = new TestResult();
+    $t->setInIsolation(true);
+    foreach ($hooks['beforeClass'] as $m) {
+        $class::$m();
+    }
+    $t->run($res);
+    foreach ($hooks['afterClass'] as $m) {
+        $class::$m();
+    }
+    $status = 'pass';
+    $msg    = '';
+    foreach ([['error', $res->errors()], ['failure', $res->failures()], ['warning', $res->warnings()],
+              ['skipped', $res->skipped()], ['incomplete', $res->notImplemented()], ['risky', $res->risky()]] as [$s, $list]) {
+        if ($list) {
+            $status = $s;
+            $msg    = $list[0]->getExceptionAsString();
+            break;
+        }
+    }
+    return ['type' => 'res', 'idx' => $idx, 'name' => $t->toString(), 'status' => $status,
+            'assertions' => $t->getNumAssertions(), 'msg' => $msg];
+}
+
+/**
+ * Run $child($item, $sock) in a forked process per item (max $jobs at once). The child writes json lines;
+ * $onLine($item, array) is called per line, $onEnd($item, int $lines, string $why) once the child is gone.
+ */
+function forkMap(array $items, int $jobs, callable $child, callable $onLine, callable $onEnd, int $idle = 120): void
+{
+    $queue   = $items;
+    $running = [];
+    while ($queue || $running) {
+        while ($queue && count($running) < $jobs) {
+            $item = array_shift($queue);
+            $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+            $pid  = pcntl_fork();
+            if ($pid === -1) {
+                fwrite(STDERR, "forktest: pcntl_fork failed\n");
+                exit(2);
+            }
+            if ($pid === 0) {
+                fclose($pair[0]);
+                $child($item, $pair[1]);
+                fclose($pair[1]);
+                // skip PHP shutdown/destructors/memory teardown: results are already sent
+                posix_kill(posix_getpid(), SIGKILL);
+                exit(0);
+            }
+            fclose($pair[1]);
+            stream_set_blocking($pair[0], false);
+            $running[$pid] = ['sock' => $pair[0], 'buf' => '', 'item' => $item, 'last' => microtime(true), 'lines' => 0];
+        }
+
+        $read = array_map(static function ($r) { return $r['sock']; }, $running);
+        $w = $e = null;
+        if (stream_select($read, $w, $e, 1) === false) {
+            break;
+        }
+        foreach ($running as $pid => &$r) {
+            if (in_array($r['sock'], $read, true)) {
+                $chunk = (string) fread($r['sock'], 65536);
+                if ($chunk !== '') {
+                    $r['buf'] .= $chunk;
+                    $r['last'] = microtime(true);
+                }
+                while (($p = strpos($r['buf'], "\n")) !== false) {
+                    $line     = substr($r['buf'], 0, $p);
+                    $r['buf'] = substr($r['buf'], $p + 1);
+                    $dec      = json_decode($line, true);
+                    if (is_array($dec)) {
+                        $r['lines']++;
+                        $onLine($r['item'], $dec);
+                    }
+                }
+            }
+            $timedOut = microtime(true) - $r['last'] > $idle;
+            if (feof($r['sock']) || $timedOut) {
+                if ($timedOut) {
+                    posix_kill($pid, SIGKILL);
+                }
+                pcntl_waitpid($pid, $st);
+                $onEnd($r['item'], $r['lines'], $timedOut ? 'timeout' : 'child produced no result');
+                fclose($r['sock']);
+                unset($running[$pid]);
+            }
+        }
+        unset($r);
+    }
+}
+
+function sender($sock): callable
+{
+    return static function (array $r) use ($sock): void {
+        fwrite($sock, json_encode($r, JSON_FLAGS) . "\n");
+        fflush($sock);
+    };
+}
+
+/** Child wrapper for single-result children: discard output, send exactly one result, convert fatals. */
+function childGuard(string $name, $sock, callable $body): void
+{
+    $sent = false;
+    $send = sender($sock);
+    $once = static function (array $r) use ($send, &$sent): void {
+        if (!$sent) {
+            $sent = true;
+            $send($r);
+        }
+    };
+    register_shutdown_function(static function () use ($once, $name): void {
+        $e = error_get_last();
+        $once(['type' => 'res', 'name' => $name, 'status' => 'error', 'assertions' => 0,
+               'msg' => 'process died: ' . ($e['message'] ?? 'no result') . ($e ? " in {$e['file']}:{$e['line']}" : '')]);
+    });
+    ob_start(static function () { return ''; });
+    try {
+        $once($body());
+    } catch (\Throwable $e) {
+        $once(['type' => 'res', 'name' => $name, 'status' => 'error', 'assertions' => 0, 'msg' => TestFailure::exceptionToString($e)]);
+    }
+}
+
+/** Per-test execution child (re-loads the file, picks test #idx). */
+$execTask = static function (array $task, $sock): void {
+    childGuard($task['name'], $sock, static function () use ($task): array {
+        $all = loadTests($task['file']);
+        if (!isset($all[$task['idx']]) || clean($all[$task['idx']][1]->toString()) !== clean($task['name'])) {
+            return ['type' => 'res', 'name' => $task['name'], 'status' => 'error', 'assertions' => 0,
+                    'msg' => 'test list changed between discovery and execution'];
+        }
+        [$class, $t] = $all[$task['idx']];
+        return runTestCase($class, $t, $task['idx']);
+    });
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Reporting state
+// ---------------------------------------------------------------------------------------------------------------
+$jobs   = $cli['jobs'];
+$stat   = ['pass' => 0, 'error' => 0, 'failure' => 0, 'warning' => 0, 'skipped' => 0, 'incomplete' => 0, 'risky' => 0];
+$bad    = [];
+$assert = 0;
+$done   = 0;
+$total  = 0;
+$mark   = ['pass' => '.', 'error' => 'E', 'failure' => 'F', 'warning' => 'W', 'skipped' => 'S', 'incomplete' => 'I', 'risky' => 'R'];
+$record = static function (array $res) use (&$stat, &$assert, &$bad, &$done, &$total, $mark): void {
+    $stat[$res['status']]++;
+    $assert += (int) $res['assertions'];
+    if (in_array($res['status'], ['error', 'failure', 'warning'], true)) {
+        $bad[] = $res;
+    }
+    echo $mark[$res['status']];
+    if (++$done % 60 === 0) {
+        echo $total > 0 ? sprintf(" %d / %d\n", $done, $total) : sprintf(" %d\n", $done);
+    }
+};
+$errorRes = static function (string $name, string $msg): array {
+    return ['type' => 'res', 'name' => $name, 'status' => 'error', 'assertions' => 0, 'msg' => $msg];
+};
+$loadError = static function (string $file, string $why) use (&$bad, &$stat, $errorRes): void {
+    $bad[] = $errorRes($file, 'cannot load test file: ' . $why);
+    $stat['error']++;
+};
+
+if (!$files) {
+    echo "No test files found.\n";
+    exit(0);
+}
+fprintf(STDERR, "forktest %s | %d files | %d workers | %s%s%s\n", FORKTEST_VERSION, count($files), $jobs,
+    $cli['fast'] ? 'fast (shared process per file)' : 'isolated (one process per test)',
+    $cli['preload'] ? ' | preload' : '',
+    filter_var(ini_get('opcache.enable_cli'), FILTER_VALIDATE_BOOLEAN) ? ' | opcache' : '');
+$t0 = microtime(true);
+
+// ---------------------------------------------------------------------------------------------------------------
+// Default mode: discovery child per file, then one child per test
+// ---------------------------------------------------------------------------------------------------------------
+if (!$cli['fast']) {
+    $tasks = [];
+    forkMap(
+        $files,
+        $jobs,
+        static function (string $file, $sock): void {
+            childGuard($file, $sock, static function () use ($file): array {
+                $names = [];
+                foreach (loadTests($file) as [$c, $t]) {
+                    $names[] = [$c, $t->toString()];
+                }
+                return ['type' => 'res', 'status' => 'ok', 'tests' => $names];
+            });
+        },
+        static function (string $file, array $res) use (&$tasks, $loadError): void {
+            if (($res['status'] ?? '') !== 'ok') {
+                $loadError($file, $res['msg'] ?? '?');
+                return;
+            }
+            foreach ($res['tests'] as $i => [$c, $n]) {
+                $tasks[] = ['file' => $file, 'idx' => $i, 'class' => $c, 'name' => $n];
+            }
+        },
+        static function (string $file, int $lines, string $why) use ($loadError): void {
+            if ($lines === 0) {
+                $loadError($file, $why);
+            }
+        }
+    );
+    if ($cli['list']) {
+        foreach ($tasks as $t) {
+            echo ' - ', $t['name'], "\n";
+        }
+        exit(0);
+    }
+
+    if ($cli['preload'] && $tasks) {
+        // run a few sample tests in children, learn which stable vendor classes they load, preload those here
+        $samples = [];
+        $step    = max(1, intdiv(count($tasks), 12));
+        for ($i = 0; $i < count($tasks); $i += $step) {
+            $samples[] = $tasks[$i];
+        }
+        $learn = ['interface' => [], 'trait' => [], 'class' => []];
+        forkMap(
+            $samples,
+            $jobs,
+            static function (array $task, $sock): void {
+                $b = [get_declared_interfaces(), get_declared_traits(), get_declared_classes()];
+                ob_start(static function () { return ''; });
+                try {
+                    $all = loadTests($task['file']);
+                    if (isset($all[$task['idx']])) {
+                        runTestCase($all[$task['idx']][0], $all[$task['idx']][1], $task['idx']);
+                    }
+                } catch (\Throwable $e) {
+                }
+                // only real files of the test framework; eval()'d mock classes must stay out of the parent
+                $keep = static function (array $now, array $before): array {
+                    $out = [];
+                    foreach (array_diff($now, $before) as $c) {
+                        $f = (new ReflectionClass($c))->getFileName();
+                        if ($f && strpos($f, "eval()'d") === false
+                            && preg_match('#/vendor/(phpunit|mockery|sebastian|myclabs|phar-io|doctrine/instantiator|hamcrest)/#', $f)) {
+                            $out[] = $c;
+                        }
+                    }
+                    return $out;
+                };
+                sender($sock)(['type' => 'warm', 'interface' => $keep(get_declared_interfaces(), $b[0]),
+                               'trait' => $keep(get_declared_traits(), $b[1]), 'class' => $keep(get_declared_classes(), $b[2])]);
+            },
+            static function (array $task, array $res) use (&$learn): void {
+                foreach (['interface', 'trait', 'class'] as $k) {
+                    $learn[$k] = array_merge($learn[$k], $res[$k] ?? []);
+                }
+            },
+            static function (): void {
+            }
+        );
+        foreach (array_unique($learn['interface']) as $c) {
+            interface_exists($c);
+        }
+        foreach (array_unique($learn['trait']) as $c) {
+            trait_exists($c);
+        }
+        foreach (array_unique($learn['class']) as $c) {
+            class_exists($c);
+        }
+    }
+
+    $total = count($tasks);
+    $t0    = microtime(true);
+    forkMap(
+        $tasks,
+        $jobs,
+        $execTask,
+        static function (array $task, array $res) use ($record): void {
+            $record($res);
+        },
+        static function (array $task, int $lines, string $why) use ($record, $errorRes): void {
+            if ($lines === 0) {
+                $record($errorRes($task['name'], $why));
+            }
+        }
+    );
+} else {
+    // -----------------------------------------------------------------------------------------------------------
+    // --fast: one worker per file; files without alias:/overload: run all their tests in that one process
+    // -----------------------------------------------------------------------------------------------------------
+    $items = [];
+    foreach ($files as $f) {
+        $src     = (string) file_get_contents($f);
+        $items[] = ['file' => $f, 'list' => $cli['list'], 'inproc' => !preg_match('/[\'"](alias|overload):/', $src)];
+    }
+    $plan     = [];   // file => ['n' => int, 'names' => [], 'done' => [idx => true]]
+    $fallback = [];   // tasks to re-run isolated (a shared worker died)
+    forkMap(
+        $items,
+        $jobs,
+        static function (array $item, $sock): void {
+            $send = sender($sock);
+            ob_start(static function () { return ''; });
+            try {
+                $tests = loadTests($item['file']);
+            } catch (\Throwable $e) {
+                $send(['type' => 'plan', 'n' => 0, 'error' => TestFailure::exceptionToString($e)]);
+                return;
+            }
+            $names = [];
+            foreach ($tests as [$c, $t]) {
+                $names[] = $t->toString();
+            }
+            $send(['type' => 'plan', 'n' => count($tests), 'names' => $names]);
+            if ($item['list']) {
+                return;   // --list: discovery only, do not run anything
+            }
+
+            $current = -1;
+            if ($item['inproc']) {
+                register_shutdown_function(static function () use (&$current, $send, $names): void {
+                    $e = error_get_last();
+                    if ($current >= 0 && $e) {
+                        $send(['type' => 'res', 'idx' => $current, 'name' => $names[$current], 'status' => 'error',
+                               'assertions' => 0, 'msg' => "process died: {$e['message']} in {$e['file']}:{$e['line']}"]);
+                    }
+                });
+            }
+            foreach ($tests as $i => [$class, $t]) {
+                $current = $i;
+                if ($item['inproc']) {
+                    try {
+                        $send(runTestCase($class, $t, $i));
+                    } catch (\Throwable $e) {
+                        $send(['type' => 'res', 'idx' => $i, 'name' => $names[$i], 'status' => 'error',
+                               'assertions' => 0, 'msg' => TestFailure::exceptionToString($e)]);
+                    }
+                    continue;
+                }
+                $pid = pcntl_fork();
+                if ($pid === 0) {
+                    $sent = false;
+                    $once = static function (array $r) use ($send, &$sent): void {
+                        if (!$sent) {
+                            $sent = true;
+                            $send($r);
+                        }
+                    };
+                    register_shutdown_function(static function () use ($once, $i, $names): void {
+                        $e = error_get_last();
+                        $once(['type' => 'res', 'idx' => $i, 'name' => $names[$i], 'status' => 'error', 'assertions' => 0,
+                               'msg' => 'process died: ' . ($e['message'] ?? 'no result') . ($e ? " in {$e['file']}:{$e['line']}" : '')]);
+                    });
+                    try {
+                        $once(runTestCase($class, $t, $i));
+                    } catch (\Throwable $e) {
+                        $once(['type' => 'res', 'idx' => $i, 'name' => $names[$i], 'status' => 'error',
+                               'assertions' => 0, 'msg' => TestFailure::exceptionToString($e)]);
+                    }
+                    posix_kill(posix_getpid(), SIGKILL);
+                    exit(0);
+                }
+                pcntl_waitpid($pid, $st);
+            }
+        },
+        static function (array $item, array $line) use (&$plan, &$total, $record, $loadError): void {
+            $f = $item['file'];
+            if ($line['type'] === 'plan') {
+                $plan[$f] = ['n' => $line['n'], 'names' => $line['names'] ?? [], 'done' => []];
+                $total   += $line['n'];
+                if (isset($line['error'])) {
+                    $loadError($f, $line['error']);
+                }
+                return;
+            }
+            $plan[$f]['done'][$line['idx']] = true;
+            $record($line);
+        },
+        static function (array $item, int $lines, string $why) use (&$plan, &$fallback, $record, $errorRes, $loadError): void {
+            $f = $item['file'];
+            if (!isset($plan[$f])) {
+                $loadError($f, $why);
+                return;
+            }
+            if ($item['list']) {
+                return;
+            }
+            for ($i = 0; $i < $plan[$f]['n']; $i++) {
+                if (isset($plan[$f]['done'][$i])) {
+                    continue;
+                }
+                if ($item['inproc']) {
+                    $fallback[] = ['file' => $f, 'idx' => $i, 'name' => $plan[$f]['names'][$i] ?? "#$i"];
+                } else {
+                    $record($errorRes($plan[$f]['names'][$i] ?? "$f#$i", 'worker died before running this test (' . $why . ')'));
+                }
+            }
+        }
+    );
+    if ($cli['list']) {
+        foreach ($plan as $p) {
+            foreach ($p['names'] as $n) {
+                echo ' - ', $n, "\n";
+            }
+        }
+        exit(0);
+    }
+    if ($fallback) {
+        fwrite(STDERR, sprintf("\n[fast] %d tests re-run isolated after a worker died\n", count($fallback)));
+        forkMap(
+            $fallback,
+            $jobs,
+            $execTask,
+            static function (array $task, array $res) use ($record): void {
+                $record($res);
+            },
+            static function (array $task, int $lines, string $why) use ($record, $errorRes): void {
+                if ($lines === 0) {
+                    $record($errorRes($task['name'], $why));
+                }
+            }
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Report
+// ---------------------------------------------------------------------------------------------------------------
+printf("\n\nTime: %.2f seconds\n", microtime(true) - $t0);
+foreach ($bad as $i => $r) {
+    if ($cli['verbose']) {
+        printf("\n%d) %s\n%s\n", $i + 1, $r['name'], (string) $r['msg']);
+    } else {
+        printf("\n%d) %s\n%s\n", $i + 1, $r['name'], strtok((string) $r['msg'], "\n") . "\n" . (strtok("\n") ?: ''));
+    }
+}
+$parts = ["Tests: $done", "Assertions: $assert"];
+foreach (['error' => 'Errors', 'failure' => 'Failures', 'warning' => 'Warnings', 'skipped' => 'Skipped',
+          'incomplete' => 'Incomplete', 'risky' => 'Risky'] as $k => $label) {
+    if ($stat[$k]) {
+        $parts[] = "$label: {$stat[$k]}";
+    }
+}
+echo ($bad ? "\nFAILURES!\n" : "\nOK\n") . implode(', ', $parts) . ".\n";
+exit($bad ? 1 : 0);
