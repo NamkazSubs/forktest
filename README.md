@@ -130,6 +130,11 @@ forktest [options] [path ...]
       --timeout SEC     kill a test that produces no result for SEC seconds (default 120)
       --stop-on-failure stop at the first error or failure (also on with stopOnFailure="true" in phpunit.xml)
       --log-junit FILE  write a JUnit XML report to FILE
+      --record-map FILE record which project files each test file loads (full run; writes the impact map)
+      --changed         only run test files affected by what changed since the merge-base with master/main
+      --since REF       like --changed, but against the given git ref (branch, tag or commit)
+      --map FILE        impact map to read for --changed/--since (default: .forktest/map.json)
+      --explain         with --changed/--since: print why each test file was selected
       --fast            one process per file instead of one per test (see above)
       --preload         load PHPUnit/Mockery classes once in the parent before forking
       --no-opcache      do not enable opcache for the run
@@ -247,6 +252,10 @@ with ParaTest otherwise). If you rely on such diagnostics, for example while upg
 - Output printed by tests is discarded. A failing test shows the first two lines of its message unless you pass `-v`.
 - A test that produces no result for 120 s (change it with `--timeout`) is killed and reported as an error.
 
+## License
+
+MIT, see [LICENSE](LICENSE). Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
 ## Development
 
 ```bash
@@ -258,7 +267,8 @@ composer selftest            # or: bash scripts/selftest.sh [path/to/vendor/auto
 exception, unmet Mockery expectation, PHP notice, fatal error, skipped, incomplete, data providers, state leak), and
 checks that forktest reports the same totals PHPUnit does (13 tests, 8 assertions, 4 errors, 2 failures, 1 skipped,
 1 incomplete). It also checks `--filter`, `--group`, `--exclude-group`, `--stop-on-failure`, `--log-junit` (valid XML,
-same totals) and `--timeout` (against `tests/fixtures/SlowTest.php`). Do not put `tests/fixtures` into a
+same totals), `--timeout` (against `tests/fixtures/SlowTest.php`) and impact selection (`--record-map`, `--changed`,
+in a throwaway git repository). Do not put `tests/fixtures` into a
 `phpunit.xml` testsuite.
 
 When changing the runner, compare against PHPUnit or ParaTest on a real suite before trusting a speedup: a faster

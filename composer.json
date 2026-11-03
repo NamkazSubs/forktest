@@ -2,6 +2,7 @@
     "name": "forktest/forktest",
     "description": "Fork-based runner for existing PHPUnit suites: per-test process isolation without re-spawning php.",
     "type": "library",
+    "license": "MIT",
     "keywords": ["phpunit", "testing", "parallel", "pcntl", "fork", "test-runner"],
     "bin": ["bin/forktest"],
     "require": {

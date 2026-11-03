@@ -130,6 +130,11 @@ forktest [options] [path ...]
       --timeout SEC     hentikan test yang tidak menghasilkan hasil selama SEC detik (default 120)
       --stop-on-failure berhenti di error atau failure pertama (juga aktif lewat stopOnFailure="true" di phpunit.xml)
       --log-junit FILE  tulis laporan JUnit XML ke FILE
+      --record-map FILE rekam file project yang dimuat tiap file test (full run; menulis peta dampak)
+      --changed         hanya jalankan file test yang terdampak perubahan sejak merge-base dengan master/main
+      --since REF       seperti --changed, tapi terhadap ref git yang diberikan (branch, tag, atau commit)
+      --map FILE        peta dampak yang dibaca untuk --changed/--since (default: .forktest/map.json)
+      --explain         bersama --changed/--since: cetak alasan tiap file test dipilih
       --fast            satu proses per file, bukan satu per test (lihat di atas)
       --preload         muat kelas PHPUnit/Mockery sekali di induk sebelum fork
       --no-opcache      jangan aktifkan opcache untuk run ini
@@ -253,6 +258,10 @@ kembali seperti biasa.
 - Test yang tidak menghasilkan hasil selama 120 detik (ubah dengan `--timeout`) dihentikan dan dilaporkan sebagai
   error.
 
+## Lisensi
+
+MIT, lihat [LICENSE](LICENSE). Daftar perubahan ada di [CHANGELOG.md](CHANGELOG.md).
+
 ## Pengembangan
 
 ```bash
@@ -264,8 +273,8 @@ composer selftest            # atau: bash scripts/selftest.sh [path/ke/vendor/au
 gagal, exception, ekspektasi Mockery yang tidak terpenuhi, notice PHP, fatal error, skipped, incomplete, data
 provider, kebocoran state), lalu memeriksa bahwa forktest melaporkan total yang sama dengan PHPUnit (13 test,
 8 assertion, 4 error, 2 failure, 1 skipped, 1 incomplete). Ia juga memeriksa `--filter`, `--group`,
-`--exclude-group`, `--stop-on-failure`, `--log-junit` (XML valid, total sama), dan `--timeout` (memakai
-`tests/fixtures/SlowTest.php`). Jangan masukkan `tests/fixtures` ke testsuite `phpunit.xml`.
+`--exclude-group`, `--stop-on-failure`, `--log-junit` (XML valid, total sama), `--timeout` (memakai
+`tests/fixtures/SlowTest.php`), dan impact selection (`--record-map`, `--changed`, di repository git sementara). Jangan masukkan `tests/fixtures` ke testsuite `phpunit.xml`.
 
 Saat mengubah runner, bandingkan dengan PHPUnit atau ParaTest di suite nyata sebelum percaya pada peningkatan
 kecepatan: run yang lebih cepat baru berarti kalau total dan daftar test yang gagal tidak berubah. Dua bug yang
