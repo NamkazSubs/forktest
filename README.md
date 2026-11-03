@@ -1,5 +1,7 @@
 # forktest
 
+**English** | [Bahasa Indonesia](README.id.md)
+
 A fork-based runner for **existing PHPUnit test suites**.
 
 PHPUnit's `processIsolation` (and `@runTestsInSeparateProcesses`) gives every test its own PHP process, which is the
