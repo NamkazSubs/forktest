@@ -122,12 +122,20 @@ forktest [options] [path ...]
 
   -j, --jobs N          parallel workers (default: number of CPU cores)
       --filter REGEX    only run tests whose name matches REGEX
+      --group NAME      only run tests in this @group (comma separated, repeatable); a test without a group is
+                        in the group "default"
+      --exclude-group NAME
+                        skip tests in this @group (comma separated, repeatable)
+      --timeout SEC     kill a test that produces no result for SEC seconds (default 120)
+      --stop-on-failure stop at the first error or failure (also on with stopOnFailure="true" in phpunit.xml)
+      --log-junit FILE  write a JUnit XML report to FILE
       --fast            one process per file instead of one per test (see above)
       --preload         load PHPUnit/Mockery classes once in the parent before forking
       --no-opcache      do not enable opcache for the run
       --bootstrap FILE  bootstrap file (default: "bootstrap" from phpunit.xml, else vendor/autoload.php)
       --list            list discovered tests and exit
-  -v, --verbose         print the full message of every failing test
+  -v, --verbose         full log: complete message and stack trace of failing tests, plus the skipped,
+                        incomplete and risky tests
   -h, --help            show help
       --version         show version
 ```
@@ -140,6 +148,23 @@ errors.
 
 `--preload` ran with identical results in the benchmark but did not make the run measurably faster once opcache
 was on, so it is off by default.
+
+## Logging
+
+The default output is lean on purpose, because forktest is about speed: one letter per test
+(`.` pass, `E` error, `F` failure, `W` warning, `S` skipped, `I` incomplete, `R` risky), then each failing test with the
+first two lines of its message, and a one-line summary. Everything below is opt-in.
+
+- `-v` prints the complete message and the filtered stack trace of every failing test, and lists the skipped,
+  incomplete and risky tests with their messages.
+- `--log-junit FILE` writes a JUnit XML report (`testsuites > testsuite` per class `> testcase`, with `failure`,
+  `error` and `skipped` elements, `classname`, `file`, `time` and `assertions`). Warnings are written as `error`,
+  incomplete tests as `skipped`, and risky tests as passing, so the totals match the summary line.
+- `--stop-on-failure` stops at the first error or failure and says how many tests were not run. Tests that were
+  already running are killed.
+
+Cost on the 6,954-test suite (single runs): default 48.5 s, `-v` 49.1 s, `--log-junit` 51.9 s (a 3 MB report).
+Stack traces are only built when `-v` or `--log-junit` is used, so the default run does the same work as before.
 
 ## Known difference: opcache and compile-time diagnostics
 
@@ -154,15 +179,16 @@ with ParaTest otherwise). If you rely on such diagnostics, for example while upg
 
 ## What it does not do (yet)
 
-- No code coverage, no JUnit/TestDox/JSON logging, no random order, no `--group` or `--exclude-group`.
+- No code coverage, no TestDox/JSON logging, no random order. (JUnit XML, `--group` and `--exclude-group` are
+  supported.)
 - No `@depends`. Every test runs in its own process, so a test that depends on another test's result is not
   supported. The suite it was developed on has none; this has not been tested.
-- From `phpunit.xml` it reads only `bootstrap`, the `<php>` section and the testsuite `<directory>`/`<file>`
-  entries (with `suffix`). Settings such as `processIsolation`, `backupGlobals`, `stopOnFailure`, `<exclude>`,
-  `<listeners>` and `<filter>` are ignored.
+- From `phpunit.xml` it reads only `bootstrap`, `stopOnFailure`, the `<php>` section and the testsuite
+  `<directory>`/`<file>` entries (with `suffix`). Settings such as `processIsolation`, `backupGlobals`,
+  `<exclude>`, `<listeners>` and `<filter>` are ignored.
 - `setUpBeforeClass` and `tearDownAfterClass` run once per test, not once per class, in both modes.
 - Output printed by tests is discarded. A failing test shows the first two lines of its message unless you pass `-v`.
-- A test that runs longer than 120 s without producing a result is killed and reported as an error.
+- A test that produces no result for 120 s (change it with `--timeout`) is killed and reported as an error.
 
 ## Development
 
@@ -174,7 +200,9 @@ composer selftest            # or: bash scripts/selftest.sh [path/to/vendor/auto
 `scripts/selftest.sh` runs `tests/fixtures/ControlTest.php`, a file of deliberately broken tests (failed assertion,
 exception, unmet Mockery expectation, PHP notice, fatal error, skipped, incomplete, data providers, state leak), and
 checks that forktest reports the same totals PHPUnit does (13 tests, 8 assertions, 4 errors, 2 failures, 1 skipped,
-1 incomplete). Do not put `tests/fixtures` into a `phpunit.xml` testsuite.
+1 incomplete). It also checks `--filter`, `--group`, `--exclude-group`, `--stop-on-failure`, `--log-junit` (valid XML,
+same totals) and `--timeout` (against `tests/fixtures/SlowTest.php`). Do not put `tests/fixtures` into a
+`phpunit.xml` testsuite.
 
 When changing the runner, compare against PHPUnit or ParaTest on a real suite before trusting a speedup: a faster
 run only counts when the totals and the set of failing tests are unchanged. Two bugs found that way so far were a

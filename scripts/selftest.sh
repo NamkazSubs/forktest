@@ -23,4 +23,24 @@ check "--filter selects a single test" "Tests: 1, Assertions: 1." "$one"
 php "$HERE/bin/forktest" --bootstrap "$BOOT" "$FIX" >/dev/null 2>&1; rc=$?
 check "exit code is 1 when tests fail" "1" "$rc"
 
+grp=$(php "$HERE/bin/forktest" --bootstrap "$BOOT" --group marked "$FIX" 2>/dev/null | grep -a '^Tests:')
+check "--group selects only tagged tests" "Tests: 1, Assertions: 1." "$grp"
+
+exc=$(php "$HERE/bin/forktest" --bootstrap "$BOOT" --exclude-group marked "$FIX" 2>/dev/null | grep -a '^Tests:')
+check "--exclude-group skips tagged tests" "Tests: 12," "$exc"
+
+stp=$(php "$HERE/bin/forktest" --bootstrap "$BOOT" -j1 --stop-on-failure "$FIX" 2>/dev/null | grep -a '^Stopped')
+check "--stop-on-failure stops early" "Stopped at the first failure" "$stp"
+
+JX="$(mktemp)"; trap 'rm -f "$JX"' EXIT
+php "$HERE/bin/forktest" --bootstrap "$BOOT" --log-junit "$JX" "$FIX" >/dev/null 2>&1
+jx=$(php -r '$x = @simplexml_load_file($argv[1]); if (!$x) { echo "invalid"; exit; } $s = $x->testsuite; echo "tests=$s[tests] errors=$s[errors] failures=$s[failures] skipped=$s[skipped] cases=" . count($x->xpath("//testcase"));' "$JX")
+check "--log-junit writes valid XML with the same totals" "tests=13 errors=4 failures=2 skipped=2 cases=13" "$jx"
+
+start=$(date +%s)
+slow=$(php "$HERE/bin/forktest" --bootstrap "$BOOT" --timeout 1 "$HERE/tests/fixtures/SlowTest.php" 2>/dev/null | grep -a '^Tests:')
+took=$(( $(date +%s) - start ))
+check "--timeout kills a hanging test" "Tests: 2, Assertions: 1, Errors: 1." "$slow"
+if [ "$took" -lt 15 ]; then echo "ok    --timeout returned in ${took}s (test sleeps 30s)"; else echo "FAIL  --timeout took ${took}s"; fail=1; fi
+
 exit $fail

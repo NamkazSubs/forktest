@@ -122,12 +122,20 @@ forktest [options] [path ...]
 
   -j, --jobs N          jumlah worker paralel (default: jumlah core CPU)
       --filter REGEX    hanya jalankan test yang namanya cocok dengan REGEX
+      --group NAME      hanya jalankan test dalam @group ini (pisahkan dengan koma, boleh diulang); test tanpa
+                        group masuk ke group "default"
+      --exclude-group NAME
+                        lewati test dalam @group ini (pisahkan dengan koma, boleh diulang)
+      --timeout SEC     hentikan test yang tidak menghasilkan hasil selama SEC detik (default 120)
+      --stop-on-failure berhenti di error atau failure pertama (juga aktif lewat stopOnFailure="true" di phpunit.xml)
+      --log-junit FILE  tulis laporan JUnit XML ke FILE
       --fast            satu proses per file, bukan satu per test (lihat di atas)
       --preload         muat kelas PHPUnit/Mockery sekali di induk sebelum fork
       --no-opcache      jangan aktifkan opcache untuk run ini
       --bootstrap FILE  file bootstrap (default: "bootstrap" dari phpunit.xml, kalau tidak ada vendor/autoload.php)
       --list            tampilkan test yang ditemukan lalu keluar
-  -v, --verbose         cetak pesan lengkap tiap test yang gagal
+  -v, --verbose         log lengkap: pesan penuh dan stack trace test yang gagal, ditambah daftar test
+                        skipped, incomplete, dan risky
   -h, --help            tampilkan bantuan
       --version         tampilkan versi
 ```
@@ -140,6 +148,25 @@ untuk kesalahan penggunaan.
 
 `--preload` memberi hasil identik di benchmark tapi tidak membuat run lebih cepat secara berarti setelah opcache
 menyala, jadi dimatikan secara default.
+
+## Logging
+
+Output default sengaja ringkas, karena fokus forktest adalah kecepatan: satu huruf per test
+(`.` lolos, `E` error, `F` failure, `W` warning, `S` skipped, `I` incomplete, `R` risky), lalu tiap test yang gagal
+dengan dua baris pertama pesannya, dan satu baris ringkasan. Semua yang di bawah ini bersifat opsional.
+
+- `-v` mencetak pesan lengkap dan stack trace (sudah difilter) tiap test yang gagal, serta mendaftar test skipped,
+  incomplete, dan risky beserta pesannya.
+- `--log-junit FILE` menulis laporan JUnit XML (`testsuites > testsuite` per class `> testcase`, dengan elemen
+  `failure`, `error`, dan `skipped`, serta atribut `classname`, `file`, `time`, dan `assertions`). Warning ditulis
+  sebagai `error`, test incomplete sebagai `skipped`, dan test risky sebagai lolos, sehingga totalnya sama dengan
+  baris ringkasan.
+- `--stop-on-failure` berhenti di error atau failure pertama dan menyebutkan berapa test yang tidak dijalankan.
+  Test yang sedang berjalan dihentikan.
+
+Biaya pada suite 6.954 test (run tunggal): default 48,5 detik, `-v` 49,1 detik, `--log-junit` 51,9 detik (laporan
+3 MB). Stack trace hanya dibangun saat `-v` atau `--log-junit` dipakai, jadi run default mengerjakan hal yang sama
+seperti sebelumnya.
 
 ## Perbedaan yang diketahui: opcache dan diagnostik compile-time
 
@@ -155,16 +182,17 @@ kembali seperti biasa.
 
 ## Yang belum didukung
 
-- Tidak ada code coverage, tidak ada logging JUnit/TestDox/JSON, tidak ada urutan acak, tidak ada `--group` atau
-  `--exclude-group`.
+- Tidak ada code coverage, tidak ada logging TestDox/JSON, tidak ada urutan acak. (JUnit XML, `--group`, dan
+  `--exclude-group` didukung.)
 - Tidak ada `@depends`. Setiap test berjalan di prosesnya sendiri, jadi test yang bergantung pada hasil test lain tidak
   didukung. Suite tempat ia dikembangkan tidak punya satu pun; ini belum diuji.
-- Dari `phpunit.xml` hanya `bootstrap`, bagian `<php>`, dan entri `<directory>`/`<file>` testsuite (dengan `suffix`)
-  yang dibaca. Pengaturan seperti `processIsolation`, `backupGlobals`, `stopOnFailure`, `<exclude>`, `<listeners>`, dan
-  `<filter>` diabaikan.
+- Dari `phpunit.xml` hanya `bootstrap`, `stopOnFailure`, bagian `<php>`, dan entri `<directory>`/`<file>` testsuite
+  (dengan `suffix`) yang dibaca. Pengaturan seperti `processIsolation`, `backupGlobals`, `<exclude>`, `<listeners>`,
+  dan `<filter>` diabaikan.
 - `setUpBeforeClass` dan `tearDownAfterClass` berjalan sekali per test, bukan sekali per class, di kedua mode.
 - Output yang dicetak test dibuang. Test yang gagal menampilkan dua baris pertama pesannya kecuali kamu memakai `-v`.
-- Test yang berjalan lebih dari 120 detik tanpa menghasilkan hasil akan dihentikan dan dilaporkan sebagai error.
+- Test yang tidak menghasilkan hasil selama 120 detik (ubah dengan `--timeout`) dihentikan dan dilaporkan sebagai
+  error.
 
 ## Pengembangan
 
@@ -176,8 +204,9 @@ composer selftest            # atau: bash scripts/selftest.sh [path/ke/vendor/au
 `scripts/selftest.sh` menjalankan `tests/fixtures/ControlTest.php`, file berisi test yang sengaja dirusak (assertion
 gagal, exception, ekspektasi Mockery yang tidak terpenuhi, notice PHP, fatal error, skipped, incomplete, data
 provider, kebocoran state), lalu memeriksa bahwa forktest melaporkan total yang sama dengan PHPUnit (13 test,
-8 assertion, 4 error, 2 failure, 1 skipped, 1 incomplete). Jangan masukkan `tests/fixtures` ke testsuite
-`phpunit.xml`.
+8 assertion, 4 error, 2 failure, 1 skipped, 1 incomplete). Ia juga memeriksa `--filter`, `--group`,
+`--exclude-group`, `--stop-on-failure`, `--log-junit` (XML valid, total sama), dan `--timeout` (memakai
+`tests/fixtures/SlowTest.php`). Jangan masukkan `tests/fixtures` ke testsuite `phpunit.xml`.
 
 Saat mengubah runner, bandingkan dengan PHPUnit atau ParaTest di suite nyata sebelum percaya pada peningkatan
 kecepatan: run yang lebih cepat baru berarti kalau total dan daftar test yang gagal tidak berubah. Dua bug yang

@@ -16,6 +16,7 @@ class ControlTest extends TestCase
         \Mockery::close();
     }
 
+    /** @group marked */
     public function testPassing() { $this->assertTrue(true); }
     public function testFailingAssert() { $this->assertSame(1, 2); }
     public function testThrows() { throw new \RuntimeException('boom'); }

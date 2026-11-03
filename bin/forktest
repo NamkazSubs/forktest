@@ -30,13 +30,21 @@ Usage:
 Options:
   -j, --jobs N          parallel workers (default: number of CPU cores)
       --filter REGEX    only run tests whose name matches REGEX (e.g. "TransferOwnership" or "::testFoo")
+      --group NAME      only run tests in this @group (comma separated, repeatable); a test without a group is in
+                        the group "default"
+      --exclude-group NAME
+                        skip tests in this @group (comma separated, repeatable)
+      --timeout SEC     kill a test that produces no result for SEC seconds (default 120)
+      --stop-on-failure stop at the first error or failure (also on with stopOnFailure="true" in phpunit.xml)
+      --log-junit FILE  write a JUnit XML report to FILE
       --fast            run tests of one file in ONE process (much faster, but tests can leak state to each
                         other). Files that use Mockery alias:/overload: are still isolated per test.
       --preload         load PHPUnit/Mockery classes once in the parent before forking
       --no-opcache      do not enable opcache for the CLI run
       --bootstrap FILE  bootstrap file (default: "bootstrap" from phpunit.xml, else vendor/autoload.php)
       --list            list the discovered tests and exit
-  -v, --verbose         print the full message of every failing test
+  -v, --verbose         full log: complete message and stack trace of failing tests, plus the skipped,
+                        incomplete and risky tests (default output shows the first two lines of each message)
   -h, --help            show this help
       --version         show the version
 
@@ -62,7 +70,11 @@ function cpuCount(): int
 }
 
 $cli = ['jobs' => cpuCount(), 'filter' => null, 'fast' => false, 'preload' => false, 'opcache' => true,
-        'bootstrap' => null, 'list' => false, 'verbose' => false, 'paths' => []];
+        'bootstrap' => null, 'list' => false, 'verbose' => false, 'paths' => [],
+        'groups' => [], 'exclude' => [], 'timeout' => 120, 'stop' => false, 'junit' => null];
+$splitList = static function (string $v): array {
+    return array_values(array_filter(array_map('trim', explode(',', $v)), 'strlen'));
+};
 $argvList = $argv;
 array_shift($argvList);
 for ($i = 0; $i < count($argvList); $i++) {
@@ -97,6 +109,24 @@ for ($i = 0; $i < count($argvList); $i++) {
             break;
         case '--bootstrap':
             $cli['bootstrap'] = $val();
+            break;
+        case '--group':
+            $cli['groups'] = array_merge($cli['groups'], $splitList($val()));
+            break;
+        case '--exclude-group':
+            $cli['exclude'] = array_merge($cli['exclude'], $splitList($val()));
+            break;
+        case '--timeout':
+            $cli['timeout'] = (int) $val();
+            if ($cli['timeout'] < 1) {
+                usageError('--timeout must be >= 1');
+            }
+            break;
+        case '--stop-on-failure':
+            $cli['stop'] = true;
+            break;
+        case '--log-junit':
+            $cli['junit'] = $val();
             break;
         case '--fast':
             $cli['fast'] = true;
@@ -157,6 +187,10 @@ foreach (['phpunit.xml', 'phpunit.xml.dist'] as $f) {
         $xml = @simplexml_load_file("$root/$f") ?: null;
         break;
     }
+}
+
+if (!$cli['stop'] && $xml !== null && strtolower((string) ($xml['stopOnFailure'] ?? '')) === 'true') {
+    $cli['stop'] = true;
 }
 
 $bootstrap = $cli['bootstrap'];
@@ -267,7 +301,26 @@ sort($files);
 // ---------------------------------------------------------------------------------------------------------------
 // Child-side helpers
 // ---------------------------------------------------------------------------------------------------------------
-$GLOBALS['forktest_filter'] = $cli['filter'];
+$GLOBALS['forktest_filter']  = $cli['filter'];
+$GLOBALS['forktest_groups']  = [$cli['groups'], $cli['exclude']];
+$GLOBALS['forktest_timeout'] = $cli['timeout'];
+$GLOBALS['forktest_stopped'] = false;
+$GLOBALS['forktest_detail']  = $cli['verbose'] || $cli['junit'] !== null;   // stack traces are only built on request
+
+/** --group / --exclude-group. A test without any @group belongs to the group "default" (like PHPUnit). */
+function inGroups($t): bool
+{
+    [$include, $exclude] = $GLOBALS['forktest_groups'];
+    if (!$include && !$exclude) {
+        return true;
+    }
+    $groups = $t instanceof TestCase ? \PHPUnit\Util\Test::getGroups(get_class($t), $t->getName(false)) : [];
+    $groups = $groups ?: ['default'];
+    if ($include && !array_intersect($include, $groups)) {
+        return false;
+    }
+    return !array_intersect($exclude, $groups);
+}
 
 /** Load a test file and return every runnable test in it, as [[class, TestCase], ...]. Must run in a child. */
 function loadTests(string $file): array
@@ -291,7 +344,8 @@ function loadTests(string $file): array
             $list = [];
             $flatten(new TestSuite($c), $list);
             foreach ($list as $t) {
-                if ($filter === null || preg_match('/' . str_replace('/', '\/', $filter) . '/', $t->toString())) {
+                if (($filter === null || preg_match('/' . str_replace('/', '\/', $filter) . '/', $t->toString()))
+                    && inGroups($t)) {
                     $tests[] = [$c, $t];
                 }
             }
@@ -314,33 +368,53 @@ function runTestCase(string $class, TestCase $t, int $idx): array
     foreach ($hooks['beforeClass'] as $m) {
         $class::$m();
     }
+    $start = microtime(true);
     $t->run($res);
+    $time = microtime(true) - $start;
     foreach ($hooks['afterClass'] as $m) {
         $class::$m();
     }
     $status = 'pass';
     $msg    = '';
+    $trace  = '';
+    $etype  = '';
     foreach ([['error', $res->errors()], ['failure', $res->failures()], ['warning', $res->warnings()],
               ['skipped', $res->skipped()], ['incomplete', $res->notImplemented()], ['risky', $res->risky()]] as [$s, $list]) {
         if ($list) {
             $status = $s;
             $msg    = $list[0]->getExceptionAsString();
+            $thrown = $list[0]->thrownException();
+            $etype  = get_class($thrown);
+            if ($GLOBALS['forktest_detail'] && in_array($s, ['error', 'failure', 'warning'], true)) {
+                $trace = \PHPUnit\Util\Filter::getFilteredStacktrace($thrown);
+            }
             break;
         }
     }
     return ['type' => 'res', 'idx' => $idx, 'name' => $t->toString(), 'status' => $status,
-            'assertions' => $t->getNumAssertions(), 'msg' => $msg];
+            'assertions' => $t->getNumAssertions(), 'msg' => $msg, 'trace' => $trace, 'etype' => $etype,
+            'time' => $time, 'file' => (new ReflectionClass($class))->getFileName()];
 }
 
 /**
  * Run $child($item, $sock) in a forked process per item (max $jobs at once). The child writes json lines;
  * $onLine($item, array) is called per line, $onEnd($item, int $lines, string $why) once the child is gone.
  */
-function forkMap(array $items, int $jobs, callable $child, callable $onLine, callable $onEnd, int $idle = 120): void
+function forkMap(array $items, int $jobs, callable $child, callable $onLine, callable $onEnd, int $idle = 0): void
 {
+    $idle    = $idle ?: (int) $GLOBALS['forktest_timeout'];
     $queue   = $items;
     $running = [];
     while ($queue || $running) {
+        if ($GLOBALS['forktest_stopped']) {
+            // --stop-on-failure: drop the queue and kill whatever is still running
+            foreach ($running as $pid => $r) {
+                posix_kill($pid, SIGKILL);
+                pcntl_waitpid($pid, $st);
+                fclose($r['sock']);
+            }
+            return;
+        }
         while ($queue && count($running) < $jobs) {
             $item = array_shift($queue);
             $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
@@ -390,7 +464,7 @@ function forkMap(array $items, int $jobs, callable $child, callable $onLine, cal
                     posix_kill($pid, SIGKILL);
                 }
                 pcntl_waitpid($pid, $st);
-                $onEnd($r['item'], $r['lines'], $timedOut ? 'timeout' : 'child produced no result');
+                $onEnd($r['item'], $r['lines'], $timedOut ? "timed out: no result for {$idle} s (see --timeout)" : 'child produced no result');
                 fclose($r['sock']);
                 unset($running[$pid]);
             }
@@ -450,15 +524,25 @@ $execTask = static function (array $task, $sock): void {
 $jobs   = $cli['jobs'];
 $stat   = ['pass' => 0, 'error' => 0, 'failure' => 0, 'warning' => 0, 'skipped' => 0, 'incomplete' => 0, 'risky' => 0];
 $bad    = [];
+$notes  = [];   // skipped / incomplete / risky tests (listed with -v)
+$all    = [];   // every result, for --log-junit
 $assert = 0;
 $done   = 0;
 $total  = 0;
 $mark   = ['pass' => '.', 'error' => 'E', 'failure' => 'F', 'warning' => 'W', 'skipped' => 'S', 'incomplete' => 'I', 'risky' => 'R'];
-$record = static function (array $res) use (&$stat, &$assert, &$bad, &$done, &$total, $mark): void {
+$record = static function (array $res) use (&$stat, &$assert, &$bad, &$notes, &$all, &$done, &$total, $mark, $cli): void {
     $stat[$res['status']]++;
     $assert += (int) $res['assertions'];
     if (in_array($res['status'], ['error', 'failure', 'warning'], true)) {
         $bad[] = $res;
+        if ($cli['stop'] && $res['status'] !== 'warning') {
+            $GLOBALS['forktest_stopped'] = true;
+        }
+    } elseif (in_array($res['status'], ['skipped', 'incomplete', 'risky'], true)) {
+        $notes[] = $res;
+    }
+    if ($cli['junit'] !== null) {
+        $all[] = $res;
     }
     echo $mark[$res['status']];
     if (++$done % 60 === 0) {
@@ -468,8 +552,11 @@ $record = static function (array $res) use (&$stat, &$assert, &$bad, &$done, &$t
 $errorRes = static function (string $name, string $msg): array {
     return ['type' => 'res', 'name' => $name, 'status' => 'error', 'assertions' => 0, 'msg' => $msg];
 };
-$loadError = static function (string $file, string $why) use (&$bad, &$stat, $errorRes): void {
+$loadError = static function (string $file, string $why) use (&$bad, &$all, &$stat, $errorRes, $cli): void {
     $bad[] = $errorRes($file, 'cannot load test file: ' . $why);
+    if ($cli['junit'] !== null) {
+        $all[] = $bad[count($bad) - 1];
+    }
     $stat['error']++;
 };
 
@@ -734,12 +821,111 @@ if (!$cli['fast']) {
 // ---------------------------------------------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------------------------------------------
+
+/** JUnit XML (testsuites > testsuite per class > testcase), readable by the usual CI parsers. */
+function writeJunit(string $file, array $results, float $seconds): bool
+{
+    $xmlSafe = static function ($v): string {
+        return (string) preg_replace('/[^\x09\x0A\x0D\x20-\x{D7FF}\x{E000}-\x{FFFD}]/u', '', (string) $v);
+    };
+    $byClass = [];
+    foreach ($results as $r) {
+        $pos   = strpos($r['name'], '::');
+        $class = $pos === false ? 'forktest' : substr($r['name'], 0, $pos);
+        $byClass[$class][] = $r;
+    }
+    $w = new XMLWriter();
+    if (!@$w->openUri($file)) {
+        return false;
+    }
+    $w->setIndent(true);
+    $w->startDocument('1.0', 'UTF-8');
+    $w->startElement('testsuites');
+    $w->startElement('testsuite');
+    $w->writeAttribute('name', 'forktest');
+    $tot = ['tests' => 0, 'assertions' => 0, 'errors' => 0, 'failures' => 0, 'skipped' => 0];
+    foreach ($results as $r) {
+        $tot['tests']++;
+        $tot['assertions'] += (int) $r['assertions'];
+        $tot['errors']     += in_array($r['status'], ['error', 'warning'], true) ? 1 : 0;
+        $tot['failures']   += $r['status'] === 'failure' ? 1 : 0;
+        $tot['skipped']    += in_array($r['status'], ['skipped', 'incomplete'], true) ? 1 : 0;
+    }
+    foreach ($tot as $k => $v) {
+        $w->writeAttribute($k, (string) $v);
+    }
+    $w->writeAttribute('time', sprintf('%.6F', $seconds));
+    foreach ($byClass as $class => $rs) {
+        $w->startElement('testsuite');
+        $w->writeAttribute('name', $xmlSafe($class));
+        $w->writeAttribute('tests', (string) count($rs));
+        $w->writeAttribute('assertions', (string) array_sum(array_map(static function ($r) { return (int) $r['assertions']; }, $rs)));
+        $w->writeAttribute('errors', (string) count(array_filter($rs, static function ($r) { return in_array($r['status'], ['error', 'warning'], true); })));
+        $w->writeAttribute('failures', (string) count(array_filter($rs, static function ($r) { return $r['status'] === 'failure'; })));
+        $w->writeAttribute('skipped', (string) count(array_filter($rs, static function ($r) { return in_array($r['status'], ['skipped', 'incomplete'], true); })));
+        $w->writeAttribute('time', sprintf('%.6F', array_sum(array_map(static function ($r) { return (float) ($r['time'] ?? 0); }, $rs))));
+        foreach ($rs as $r) {
+            $pos  = strpos($r['name'], '::');
+            $name = $pos === false ? $r['name'] : substr($r['name'], $pos + 2);
+            $w->startElement('testcase');
+            $w->writeAttribute('name', $xmlSafe($name));
+            $w->writeAttribute('class', $xmlSafe($class));
+            $w->writeAttribute('classname', $xmlSafe($class));
+            if (!empty($r['file'])) {
+                $w->writeAttribute('file', $xmlSafe($r['file']));
+            }
+            $w->writeAttribute('assertions', (string) (int) $r['assertions']);
+            $w->writeAttribute('time', sprintf('%.6F', (float) ($r['time'] ?? 0)));
+            $text = $xmlSafe($r['name'] . "\n\n" . $r['msg'] . (($r['trace'] ?? '') !== '' ? "\n" . $r['trace'] : ''));
+            switch ($r['status']) {
+                case 'failure':
+                    $w->startElement('failure');
+                    $w->writeAttribute('type', $xmlSafe($r['etype'] ?? 'failure') ?: 'failure');
+                    $w->text($text);
+                    $w->endElement();
+                    break;
+                case 'error':
+                case 'warning':
+                    $w->startElement('error');
+                    $w->writeAttribute('type', $xmlSafe(($r['etype'] ?? '') ?: $r['status']));
+                    $w->text($text);
+                    $w->endElement();
+                    break;
+                case 'skipped':
+                case 'incomplete':
+                    $w->startElement('skipped');
+                    if ($r['msg'] !== '') {
+                        $w->writeAttribute('message', $xmlSafe($r['msg']));
+                    }
+                    $w->endElement();
+                    break;
+            }
+            $w->endElement();
+        }
+        $w->endElement();
+    }
+    $w->endElement();
+    $w->endElement();
+    $w->endDocument();
+    $w->flush();
+    return true;
+}
+
 printf("\n\nTime: %.2f seconds\n", microtime(true) - $t0);
 foreach ($bad as $i => $r) {
     if ($cli['verbose']) {
-        printf("\n%d) %s\n%s\n", $i + 1, $r['name'], (string) $r['msg']);
+        printf("\n%d) %s\n%s\n", $i + 1, $r['name'], rtrim((string) $r['msg']));
+        if (($r['trace'] ?? '') !== '') {
+            printf("\n%s\n", rtrim($r['trace']));
+        }
     } else {
         printf("\n%d) %s\n%s\n", $i + 1, $r['name'], strtok((string) $r['msg'], "\n") . "\n" . (strtok("\n") ?: ''));
+    }
+}
+if ($cli['verbose'] && $notes) {
+    printf("\n--\nThere %s %d skipped, incomplete or risky test%s:\n", count($notes) === 1 ? 'was' : 'were', count($notes), count($notes) === 1 ? '' : 's');
+    foreach ($notes as $i => $r) {
+        printf("\n%d) [%s] %s\n%s\n", $i + 1, $r['status'], $r['name'], rtrim((string) $r['msg']));
     }
 }
 $parts = ["Tests: $done", "Assertions: $assert"];
@@ -750,4 +936,16 @@ foreach (['error' => 'Errors', 'failure' => 'Failures', 'warning' => 'Warnings',
     }
 }
 echo ($bad ? "\nFAILURES!\n" : "\nOK\n") . implode(', ', $parts) . ".\n";
+if ($GLOBALS['forktest_stopped']) {
+    echo $total > $done
+        ? sprintf("Stopped at the first failure (--stop-on-failure): %d of %d tests were not run.\n", $total - $done, $total)
+        : "Stopped at the first failure (--stop-on-failure).\n";
+}
+if ($cli['junit'] !== null) {
+    if (writeJunit($cli['junit'], $all, microtime(true) - $t0)) {
+        fwrite(STDERR, "JUnit report written to {$cli['junit']}\n");
+    } else {
+        fwrite(STDERR, "forktest: cannot write JUnit report to {$cli['junit']}\n");
+    }
+}
 exit($bad ? 1 : 0);
